@@ -7,7 +7,7 @@ from openai import OpenAI
 from pyrogram import Client, filters, errors
 from pyrogram.types import InlineQueryResultArticle, InputTextMessageContent
 from qdrant_client import QdrantClient
-from qdrant_client.models import PointStruct, VectorParams
+from qdrant_client.models import PointStruct
 
 load_dotenv()
 
@@ -17,7 +17,6 @@ CHATS_COLLECTION = "telegram_chats"
 MAX_POINTS_WARN_THRESHOLD = 800_000  # Qdrant free tier ~1M vector capacity warning limit
 STORAGE_CHECK_INTERVAL_SECONDS = 3600  # Check DB capacity every hour
 
-# --- Initialization ---
 print("🚀 Initializing components...")
 
 # 1. Load Local Embedding Model (384 Dimensions)
@@ -50,7 +49,7 @@ inline_bot = Client(
     bot_token=os.getenv("BOT_TOKEN")
 )
 
-# Global holder for admin ID (auto-detected on boot)
+# Global holder for admin ID
 ADMIN_USER_ID = None
 alert_sent = False
 
@@ -233,7 +232,7 @@ async def historical_catchup():
                 )
 
             qdrant.upsert(collection_name=MESSAGES_COLLECTION, points=points)
-            await asyncio.sleep(0.2)  # Non-blocking pause between chats
+            await asyncio.sleep(0.2)
     except errors.FloodWait as e:
         await asyncio.sleep(e.value)
     except Exception as e:
@@ -255,19 +254,22 @@ async def monitor_qdrant_capacity():
 
             if points_count >= MAX_POINTS_WARN_THRESHOLD and not alert_sent:
                 alert_text = (
-                    f"⚠️ **QDRANT STORAGE WARNING** ⚠️\n\n"
+                    f"⚠️ **QDRANT STORAGE WARNING** ⚠️️\n\n"
                     f"Your database is approaching its capacity limit!\n"
                     f"Current Indexed Messages: `{points_count:,}`\n"
                     f"Threshold Warning Level: `{MAX_POINTS_WARN_THRESHOLD:,}`\n\n"
-                    f"Please purge old messages or upgrade your Qdrant cluster to prevent data ingestion drops."
+                    f"Please purge old messages or upgrade your Qdrant cluster."
                 )
                 if ADMIN_USER_ID:
-                    await inline_bot.send_message(chat_id=ADMIN_USER_ID, text=alert_text)
-                    print(f"🔔 Overfill alert dispatched to user ID {ADMIN_USER_ID}")
-                    alert_sent = True
+                    try:
+                        await inline_bot.send_message(chat_id=ADMIN_USER_ID, text=alert_text)
+                        print(f"🔔 Overfill alert dispatched to user ID {ADMIN_USER_ID}")
+                        alert_sent = True
+                    except errors.PeerIdInvalid:
+                        print(f"⚠️ Storage alert triggered ({points_count:,} points), but bot cannot message user {ADMIN_USER_ID} until you click /start in Telegram.")
 
             elif points_count < MAX_POINTS_WARN_THRESHOLD and alert_sent:
-                alert_sent = False  # Reset warning flag if vectors are deleted
+                alert_sent = False
 
         except Exception as e:
             print(f"Error checking Qdrant capacity: {e}")
@@ -286,16 +288,29 @@ async def main():
     await inline_bot.start()
 
     me = await userbot.get_me()
+    bot_me = await inline_bot.get_me()
+
     ADMIN_USER_ID = me.id
+    target_bot_username = os.getenv("BOT_USERNAME", f"@{bot_me.username}")
+
     print(f"✅ Logged in as User: {me.first_name} (ID: {ADMIN_USER_ID})")
+    print(f"🤖 Bot active: {target_bot_username}")
 
-    # Send a bootup notification to yourself
-    await inline_bot.send_message(
-        chat_id=ADMIN_USER_ID,
-        text="🚀 **Telegram Scraper & Vector Search Engine Started**\nReal-time ingestion and capacity monitoring are now active."
-    )
+    try:
+        await inline_bot.send_message(
+            chat_id=ADMIN_USER_ID,
+            text="🚀 **Telegram Scraper & Vector Search Engine Started**\nReal-time ingestion and capacity monitoring are now active."
+        )
+        print("📩 Bootup notification sent to your Telegram DM!")
+    except errors.PeerIdInvalid:
+        print(
+            f"\n⚠️ ACTION REQUIRED:\n"
+            f"   Open Telegram, search for {target_bot_username}, and click /start.\n"
+            f"   The engine is running, but the bot needs you to message it first to send alerts.\n"
+        )
+    except Exception as e:
+        print(f"Notice: Could not send startup message: {e}")
 
-    # Launch non-blocking background tasks
     asyncio.create_task(historical_catchup())
     asyncio.create_task(monitor_qdrant_capacity())
 
