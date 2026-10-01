@@ -1,4 +1,5 @@
 import asyncio
+import os
 from dotenv import load_dotenv
 from pyrogram import Client, errors
 from qdrant_client.models import PointStruct
