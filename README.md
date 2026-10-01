@@ -2,6 +2,8 @@
 
 A decoupled, low-cost Telegram chat indexing and semantic search system. The engine listens to incoming Telegram messages in real time via a Pyrogram Userbot, generates local vector embeddings using FastEmbed, stores them in Qdrant Cloud, and exposes a natural language RAG interface via a Telegram Inline Bot powered by DeepSeek AI.
 
+It also supports **multi-modal ingestion**: images are OCR'd and PDF/DOCX/TXT documents are text-extracted, so their contents become semantically searchable alongside regular messages.
+
 ---
 
 ## 🤖 How to Interact with the Bot
@@ -37,6 +39,34 @@ Synthesizes top semantic matches across all indexed history into a single, conci
 💬 Individual Matched Messages (Below AI Summary):
 Displays individual raw chat messages matching your query, complete with sender name, source chat title, date timestamp, and a clickable Jump to message Telegram link (t.me/c/...).
 
+🧠 Multi-Modal Ingestion (OCR & Documents)
+
+Beyond plain text and captions, the engine extracts searchable text from media attachments:
+
+* **Images (OCR):** Photos are downloaded and passed through Tesseract OCR (`pytesseract` + `Pillow`). Extracted text is indexed with `source_type="photo_ocr"`. OCR languages are configurable via the `OCR_LANGUAGES` env var (default `eng+rus`).
+* **PDF Documents:** Text is extracted with `pypdf` and indexed with `source_type="document_pdf"`.
+* **DOCX Documents:** Text is extracted with `python-docx` and indexed with `source_type="document_docx"`.
+* **Plain Text Files:** `.txt` attachments are read directly and indexed with `source_type="document_txt"`.
+
+Extraction rules:
+
+* Only files with extensions in `SUPPORTED_DOC_EXTENSIONS` (`.pdf`, `.docx`, `.txt`) are processed.
+* Documents larger than `MAX_DOCUMENT_BYTES` (20 MB) are skipped.
+* Extracted text shorter than `MIN_EXTRACTED_TEXT_LENGTH` (10 chars) is discarded.
+* Each optional dependency is loaded defensively — if `pytesseract`, `pypdf`, or `python-docx` is missing, that modality is disabled with a warning and the engine keeps running.
+
+The `source_type` field is stored in each message payload and surfaced in inline results, so you can tell whether a match came from a message, an OCR'd image, or a document.
+
+🛡️ StorageShield (Capacity Guard)
+
+`start.py` runs a background `StorageShield` task that periodically checks the size of the `telegram_messages` collection against `MAX_VECTORS` (default `100,000`, configurable via env):
+
+* **≥ 80% capacity (`STORAGE_WARN_RATIO`):** sends a one-time warning DM to the admin via the inline bot.
+* **≥ 95% capacity (`STORAGE_PAUSE_RATIO`):** sets `scraping_paused = True`, which halts the background catch-up and deep scrapers to protect the cluster, and sends a critical DM.
+* **Below 80%:** resets the alert flag and resumes scraping automatically.
+
+The check interval is controlled by `STORAGE_CHECK_INTERVAL_SECONDS` (default 3600s). Alerts require the admin to have clicked `/start` on the bot first (otherwise Telegram returns `PeerIdInvalid`).
+
 🏗️ Architecture & Tech Stack
    [ Telegram Chats / Groups ]
                 │
@@ -63,10 +93,11 @@ LLM Synthesis: DeepSeek API (deepseek-chat)
 📁 Repository Structure
 
 .
+├── core.py           # Shared clients (Qdrant, DeepSeek, FastEmbed) and helpers
 ├── setup_db.py       # Initializes Qdrant collections and payload indexes
-├── scraper.py        # Historical catch-up & batch scraping script
-├── listener.py       # Standalone real-time Pyrogram message listener
-├── bot.py            # Standalone Telegram Inline Bot interface
+├── scraper.py        # CLI wrapper: runs the historical catch-up scraper
+├── listener.py       # CLI wrapper: runs the real-time Pyrogram message listener
+├── bot.py            # CLI wrapper: runs the Telegram Inline Bot interface
 ├── start.py          # Unified continuous engine (Listener + Bot + Scraper + Monitor)
 ├── start.sh          # Executable shell runner with virtualenv check
 ├── requirements.txt  # Python package dependencies
@@ -125,4 +156,5 @@ To run continuously in the background on local macOS or AWS EC2:
 Bash
 nohup ./start.sh > bot.log 2>&1 &
 📊 Storage Monitoring & Safety
-start.py continuously monitors your vector collection point count against a threshold (800,000 vectors by default). If your Qdrant Cloud storage limit approaches maximum capacity, the engine sends an automated administrative notification directly to your Telegram DM.
+
+`start.py` continuously monitors your vector collection point count against `MAX_VECTORS` (default `100,000`, configurable via the `MAX_VECTORS` env var). See the **StorageShield** section above for the full warning/pause behavior. If your Qdrant Cloud storage limit approaches maximum capacity, the engine sends an automated administrative notification directly to your Telegram DM and pauses background ingestion at the critical threshold.
