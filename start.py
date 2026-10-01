@@ -1,7 +1,9 @@
 import asyncio
+import io
 import os
 import uuid
 import re
+import tempfile
 from dotenv import load_dotenv
 from fastembed import TextEmbedding
 from openai import OpenAI
@@ -9,6 +11,29 @@ from pyrogram import Client, filters, errors
 from pyrogram.types import InlineQueryResultArticle, InputTextMessageContent
 from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
+
+# --- Multi-modal extraction (optional dependencies) ---
+try:
+    import pytesseract
+    from PIL import Image
+    OCR_AVAILABLE = True
+except ImportError:
+    OCR_AVAILABLE = False
+    print("⚠️ pytesseract/Pillow not installed — image OCR disabled.")
+
+try:
+    from pypdf import PdfReader
+    PYPDF_AVAILABLE = True
+except ImportError:
+    PYPDF_AVAILABLE = False
+    print("⚠️ pypdf not installed — PDF extraction disabled.")
+
+try:
+    import docx  # python-docx
+    DOCX_AVAILABLE = True
+except ImportError:
+    DOCX_AVAILABLE = False
+    print("⚠️ python-docx not installed — DOCX extraction disabled.")
 
 
 load_dotenv()
@@ -84,6 +109,16 @@ FILTER_MIN_SAMPLES = 10
 # Background scrapers check this flag and stop ingesting new points.
 scraping_paused = False
 
+# --- Multi-modal extraction settings ---
+# Minimum extracted text length required to index OCR/document content.
+MIN_EXTRACTED_TEXT_LENGTH = 10
+# Maximum bytes to download for document extraction (avoid huge files).
+MAX_DOCUMENT_BYTES = 20 * 1024 * 1024  # 20 MB
+# Supported document extensions for text extraction.
+SUPPORTED_DOC_EXTENSIONS = {".pdf", ".docx", ".txt"}
+# OCR language(s) passed to Tesseract (e.g. "eng+rus").
+OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "eng+rus")
+
 
 def build_message_link(chat, message_id):
     """Build a correct Telegram deep-link for private chats, groups, and channels."""
@@ -97,6 +132,126 @@ def build_message_link(chat, message_id):
 async def embed_texts(texts):
     """Run the synchronous FastEmbed model in a worker thread to avoid blocking the event loop."""
     return await asyncio.to_thread(lambda: list(embedding_model.embed(texts)))
+
+
+def _ocr_image_bytes(image_bytes):
+    """Synchronous OCR on raw image bytes. Returns extracted text or ''."""
+    if not OCR_AVAILABLE:
+        return ""
+    try:
+        image = Image.open(io.BytesIO(image_bytes))
+        # Convert to RGB to avoid palette/alpha issues with Tesseract
+        if image.mode not in ("RGB", "L"):
+            image = image.convert("RGB")
+        return pytesseract.image_to_string(image, lang=OCR_LANGUAGES).strip()
+    except Exception as e:
+        print(f"⚠️ OCR error: {e}")
+        return ""
+
+
+def _extract_pdf_text(path):
+    """Synchronous PDF text extraction. Returns extracted text or ''."""
+    if not PYPDF_AVAILABLE:
+        return ""
+    try:
+        reader = PdfReader(path)
+        chunks = []
+        for page in reader.pages:
+            try:
+                chunks.append(page.extract_text() or "")
+            except Exception:
+                continue
+        return "\n".join(chunks).strip()
+    except Exception as e:
+        print(f"⚠️ PDF extraction error: {e}")
+        return ""
+
+
+def _extract_docx_text(path):
+    """Synchronous DOCX text extraction. Returns extracted text or ''."""
+    if not DOCX_AVAILABLE:
+        return ""
+    try:
+        document = docx.Document(path)
+        return "\n".join(p.text for p in document.paragraphs).strip()
+    except Exception as e:
+        print(f"⚠️ DOCX extraction error: {e}")
+        return ""
+
+
+def _extract_txt_text(path):
+    """Synchronous plain-text extraction. Returns extracted text or ''."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="ignore") as f:
+            return f.read().strip()
+    except Exception as e:
+        print(f"⚠️ TXT extraction error: {e}")
+        return ""
+
+
+async def extract_text_from_media(message):
+    """Extract text from a photo (OCR) or document attachment.
+
+    Returns a tuple `(extracted_text, source_type)` where `source_type` is one
+    of: 'text', 'photo_ocr', 'document_pdf', 'document_docx', 'document_txt',
+    or 'none' if nothing could be extracted.
+    """
+    # --- Photo OCR ---
+    if getattr(message, "photo", None):
+        if not OCR_AVAILABLE:
+            return "", "none"
+        try:
+            buffer = await userbot.download_media(message, in_memory=True)
+            if buffer is None:
+                return "", "none"
+            image_bytes = buffer.getvalue() if hasattr(buffer, "getvalue") else bytes(buffer)
+            text = await asyncio.to_thread(_ocr_image_bytes, image_bytes)
+            if len(text) >= MIN_EXTRACTED_TEXT_LENGTH:
+                return text, "photo_ocr"
+        except Exception as e:
+            print(f"⚠️ Photo download/OCR failed: {e}")
+        return "", "none"
+
+    # --- Document extraction ---
+    document = getattr(message, "document", None)
+    if document:
+        file_name = (document.file_name or "").lower()
+        ext = os.path.splitext(file_name)[1]
+        if ext not in SUPPORTED_DOC_EXTENSIONS:
+            return "", "none"
+        if (document.file_size or 0) > MAX_DOCUMENT_BYTES:
+            print(f"⚠️ Skipping oversized document ({document.file_size} bytes): {file_name}")
+            return "", "none"
+
+        tmp_path = None
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=ext)
+            os.close(tmp_fd)
+            await userbot.download_media(message, file_name=tmp_path)
+
+            if ext == ".pdf":
+                text = await asyncio.to_thread(_extract_pdf_text, tmp_path)
+                source_type = "document_pdf"
+            elif ext == ".docx":
+                text = await asyncio.to_thread(_extract_docx_text, tmp_path)
+                source_type = "document_docx"
+            else:  # .txt
+                text = await asyncio.to_thread(_extract_txt_text, tmp_path)
+                source_type = "document_txt"
+
+            if len(text) >= MIN_EXTRACTED_TEXT_LENGTH:
+                return text, source_type
+        except Exception as e:
+            print(f"⚠️ Document extraction failed for {file_name}: {e}")
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+        return "", "none"
+
+    return "", "none"
 
 
 async def is_high_value_chat(chat):
@@ -245,14 +400,23 @@ async def StorageShield():
 # ==========================================
 # 1. REAL-TIME USERBOT LISTENER
 # ==========================================
-@userbot.on_message(filters.text | filters.caption)
+@userbot.on_message(filters.text | filters.caption | filters.photo | filters.document)
 async def process_incoming_message(client, message):
     try:
         # 1. Extract text or caption
         raw_text = message.text or message.caption or ""
         text = raw_text.strip()
-        if len(text) < 10:
-            return
+        source_type = "text"
+
+        # 1b. Multi-modal fallback: OCR photos / parse documents when there is
+        #     no usable text/caption on the message itself.
+        if len(text) < MIN_EXTRACTED_TEXT_LENGTH:
+            extracted, extracted_source = await extract_text_from_media(message)
+            if extracted:
+                text = extracted
+                source_type = extracted_source
+            else:
+                return
 
         chat = message.chat
         chat_title = chat.title or chat.first_name or "Private Chat"
@@ -306,6 +470,7 @@ async def process_incoming_message(client, message):
             "sender_name": sender_name,
             "sender_username": sender_username,
             "text": text,
+            "source_type": source_type,
             "date": str(message.date),
             "link": message_link
         }
@@ -368,8 +533,10 @@ async def answer_inline_query(client, inline_query):
         for msg_hit in matched_messages:
             mp = msg_hit.payload
             user_str = f"{mp.get('sender_name')}" + (f" (@{mp.get('sender_username')})" if mp.get('sender_username') else "")
+            source_type = mp.get("source_type", "text")
+            source_tag = "" if source_type == "text" else f" ({source_type})"
             msg_context_lines.append(
-                f"- [{user_str} in '{mp.get('chat_title')}']: {mp.get('text')}"
+                f"- [{user_str} in '{mp.get('chat_title')}'{source_tag}]: {mp.get('text')}"
             )
 
         context_str = (
@@ -461,13 +628,22 @@ async def historical_catchup():
                     ]
                 )
 
-                # 2. Fetch recent history (extract text or media captions)
+                # 2. Fetch recent history (extract text, captions, OCR, documents)
                 messages_to_process = []
                 async for message in userbot.get_chat_history(chat.id, limit=100):
                     raw_text = message.text or message.caption or ""
                     clean_text = raw_text.strip()
-                    if len(clean_text) >= 10:
-                        messages_to_process.append((message, clean_text))
+                    source_type = "text"
+
+                    if len(clean_text) < MIN_EXTRACTED_TEXT_LENGTH:
+                        extracted, extracted_source = await extract_text_from_media(message)
+                        if extracted:
+                            clean_text = extracted
+                            source_type = extracted_source
+                        else:
+                            continue
+
+                    messages_to_process.append((message, clean_text, source_type))
 
                 if not messages_to_process:
                     continue
@@ -476,7 +652,7 @@ async def historical_catchup():
                 embeddings = await embed_texts(texts)
 
                 points = []
-                for (message, text), embedding in zip(messages_to_process, embeddings):
+                for (message, text, source_type), embedding in zip(messages_to_process, embeddings):
                     # Sender extraction with full name and username handle
                     if message.from_user:
                         sender_id = message.from_user.id
@@ -506,6 +682,7 @@ async def historical_catchup():
                                 "sender_name": sender_name,
                                 "sender_username": sender_username,
                                 "text": text,
+                                "source_type": source_type,
                                 "date": str(message.date),
                                 "link": message_link
                             }
@@ -603,8 +780,18 @@ async def continuous_deep_scraper():
                         ):
                             raw_text = message.text or message.caption or ""
                             clean_text = raw_text.strip()
-                            if len(clean_text) >= 10:
-                                batch.append((message, clean_text))
+                            source_type = "text"
+
+                            if len(clean_text) < MIN_EXTRACTED_TEXT_LENGTH:
+                                extracted, extracted_source = await extract_text_from_media(message)
+                                if extracted:
+                                    clean_text = extracted
+                                    source_type = extracted_source
+                                else:
+                                    offset_id = message.id
+                                    continue
+
+                            batch.append((message, clean_text, source_type))
                             offset_id = message.id
 
                         if not batch:
@@ -614,7 +801,7 @@ async def continuous_deep_scraper():
                         embeddings = await embed_texts(texts)
 
                         points = []
-                        for (message, text), embedding in zip(batch, embeddings):
+                        for (message, text, source_type), embedding in zip(batch, embeddings):
                             if message.from_user:
                                 sender_id = message.from_user.id
                                 first_name = message.from_user.first_name or ""
@@ -646,6 +833,7 @@ async def continuous_deep_scraper():
                                         "sender_name": sender_name,
                                         "sender_username": sender_username,
                                         "text": text,
+                                        "source_type": source_type,
                                         "date": str(message.date),
                                         "link": message_link,
                                     },
