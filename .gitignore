@@ -35,6 +35,9 @@ wheels/
 .installed.cfg
 *.egg
 
+# Audit / Generated Reports
+summary.md
+
 # IDE and OS Files
 .DS_Store
 .DS_Store?
