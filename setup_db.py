@@ -63,6 +63,18 @@ client.create_payload_index(
     field_name="chat_id",
     field_schema=PayloadSchemaType.KEYWORD,
 )
+# Index sender_username for per-user lookups
+client.create_payload_index(
+    collection_name=MESSAGES_COLLECTION,
+    field_name="sender_username",
+    field_schema=PayloadSchemaType.KEYWORD,
+)
+# Index source_type to filter by ingestion source (text, photo_ocr, document_*)
+client.create_payload_index(
+    collection_name=MESSAGES_COLLECTION,
+    field_name="source_type",
+    field_schema=PayloadSchemaType.KEYWORD,
+)
 
 # 2. Collection for frontend group lookup (vectorized so chats are semantically searchable)
 ensure_collection(

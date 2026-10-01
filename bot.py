@@ -1,36 +1,18 @@
-import asyncio
 import os
 from dotenv import load_dotenv
-from fastembed import TextEmbedding
-from openai import OpenAI
 from pyrogram import Client
 from pyrogram.types import InlineQueryResultArticle, InputTextMessageContent
-from qdrant_client import QdrantClient
+
+from core import (
+    MESSAGES_COLLECTION,
+    deepseek_client,
+    embed_texts,
+    qdrant,
+)
 
 load_dotenv()
 
-# 1. Load FastEmbed Model
-print("Loading FastEmbed model for inline search...")
-embedding_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-
-async def embed_texts(texts):
-    """Run the synchronous FastEmbed model in a worker thread to avoid blocking the event loop."""
-    return await asyncio.to_thread(lambda: list(embedding_model.embed(texts)))
-
-# 2. Qdrant Client
-qdrant = QdrantClient(
-    url=os.getenv("QDRANT_URL"),
-    api_key=os.getenv("QDRANT_API_KEY")
-)
-
-# 3. DeepSeek API Client (OpenAI SDK Compatible)
-deepseek_client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
-
-# 4. Pyrogram Bot Client
+# Pyrogram Bot Client
 bot = Client(
     "inline_bot",
     api_id=int(os.getenv("TELEGRAM_API_ID")),
@@ -50,7 +32,7 @@ async def answer_inline_query(client, inline_query):
 
         # Step 2: Search top 5 relevant messages in Qdrant
         search_response = qdrant.query_points(
-            collection_name="telegram_messages",
+            collection_name=MESSAGES_COLLECTION,
             query=query_vector,
             limit=5
         )
@@ -69,8 +51,7 @@ async def answer_inline_query(client, inline_query):
         context_str = "\n".join(context_lines)
 
         try:
-            ai_response = await asyncio.to_thread(
-                deepseek_client.chat.completions.create,
+            ai_response = await deepseek_client.chat.completions.create(
                 model="deepseek-chat",
                 messages=[
                     {

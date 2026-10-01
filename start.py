@@ -1,16 +1,23 @@
 import asyncio
 import io
 import os
-import uuid
 import re
 import tempfile
 from dotenv import load_dotenv
-from fastembed import TextEmbedding
-from openai import OpenAI
 from pyrogram import Client, filters, errors
 from pyrogram.types import InlineQueryResultArticle, InputTextMessageContent
-from qdrant_client import QdrantClient
 from qdrant_client.models import PointStruct
+
+from core import (
+    CHATS_COLLECTION,
+    MESSAGES_COLLECTION,
+    build_message_payload,
+    deepseek_client,
+    embed_texts,
+    message_point_id,
+    qdrant,
+    upsert_chat,
+)
 
 # --- Multi-modal extraction (optional dependencies) ---
 try:
@@ -39,8 +46,6 @@ except ImportError:
 load_dotenv()
 
 # --- Configuration & Limits ---
-MESSAGES_COLLECTION = "telegram_messages"
-CHATS_COLLECTION = "telegram_chats"
 MAX_VECTORS = int(os.getenv("MAX_VECTORS", "100000"))  # Hard capacity ceiling for the messages collection
 STORAGE_WARN_RATIO = 0.80   # Send a DM notification at 80% capacity
 STORAGE_PAUSE_RATIO = 0.95  # Pause background scraping at 95% capacity
@@ -50,29 +55,14 @@ SCRAPER_PAGE_SIZE = 100  # Messages fetched per history page
 
 print("🚀 Initializing components...")
 
-# 1. Load Local Embedding Model (384 Dimensions)
-embedding_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-# 2. Connect to Qdrant Cloud
-qdrant = QdrantClient(
-    url=os.getenv("QDRANT_URL"),
-    api_key=os.getenv("QDRANT_API_KEY")
-)
-
-# 3. DeepSeek API Client
-deepseek_client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)
-
-# 4. Pyrogram Userbot Client (Ingestion & Catch-up)
+# Pyrogram Userbot Client (Ingestion & Catch-up)
 userbot = Client(
     "my_userbot",
     api_id=int(os.getenv("TELEGRAM_API_ID")),
     api_hash=os.getenv("TELEGRAM_API_HASH")
 )
 
-# 5. Pyrogram Inline Bot Client (Search & Query Interface)
+# Pyrogram Inline Bot Client (Search & Query Interface)
 inline_bot = Client(
     "inline_bot",
     api_id=int(os.getenv("TELEGRAM_API_ID")),
@@ -118,20 +108,6 @@ MAX_DOCUMENT_BYTES = 20 * 1024 * 1024  # 20 MB
 SUPPORTED_DOC_EXTENSIONS = {".pdf", ".docx", ".txt"}
 # OCR language(s) passed to Tesseract (e.g. "eng+rus").
 OCR_LANGUAGES = os.getenv("OCR_LANGUAGES", "eng+rus")
-
-
-def build_message_link(chat, message_id):
-    """Build a correct Telegram deep-link for private chats, groups, and channels."""
-    if getattr(chat, "username", None):
-        return f"https://t.me/{chat.username}/{message_id}"
-    # Strip '-100' prefix from supergroup/channel IDs for web/app deep-linking
-    clean_chat_id = str(chat.id).replace("-100", "").replace("-", "")
-    return f"https://t.me/c/{clean_chat_id}/{message_id}"
-
-
-async def embed_texts(texts):
-    """Run the synchronous FastEmbed model in a worker thread to avoid blocking the event loop."""
-    return await asyncio.to_thread(lambda: list(embedding_model.embed(texts)))
 
 
 def _ocr_image_bytes(image_bytes):
@@ -419,68 +395,20 @@ async def process_incoming_message(client, message):
                 return
 
         chat = message.chat
-        chat_title = chat.title or chat.first_name or "Private Chat"
-        chat_username = chat.username or ""
 
-        # 2. Safely extract sender details and username
-        if message.from_user:
-            sender_id = message.from_user.id
-            first_name = message.from_user.first_name or ""
-            last_name = message.from_user.last_name or ""
-            sender_name = f"{first_name} {last_name}".strip() or "Unknown"
-            sender_username = message.from_user.username or ""
-        else:
-            sender_id = chat.id
-            sender_name = chat_title
-            sender_username = chat_username
+        # 2. Upsert Chat Metadata (Vectorized so CHATS_COLLECTION is semantically searchable)
+        await upsert_chat(chat)
 
-        # 3. Format Telegram deep-link correctly
-        message_link = build_message_link(chat, message.id)
-
-        # 4. Upsert Chat Metadata (Vectorized so CHATS_COLLECTION is semantically searchable)
-        chat_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chat_{chat.id}"))
-        chat_embed_text = f"Group: {chat_title}" + (f" (@{chat_username})" if chat_username else "")
-        chat_embedding = (await embed_texts([chat_embed_text]))[0].tolist()
-
-        qdrant.upsert(
-            collection_name=CHATS_COLLECTION,
-            points=[
-                PointStruct(
-                    id=chat_point_id,
-                    vector=chat_embedding,
-                    payload={
-                        "chat_id": chat.id,
-                        "chat_title": chat_title,
-                        "chat_type": str(chat.type),
-                        "username": chat_username,
-                    }
-                )
-            ]
-        )
-
-        # 5. Embed message and store full payload (offloaded to a thread)
+        # 3. Embed message and store full payload (offloaded to a thread)
         msg_embedding = (await embed_texts([text]))[0].tolist()
-        msg_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{chat.id}_{message.id}"))
-
-        msg_payload = {
-            "message_id": message.id,
-            "chat_id": chat.id,
-            "chat_title": chat_title,
-            "sender_id": sender_id,
-            "sender_name": sender_name,
-            "sender_username": sender_username,
-            "text": text,
-            "source_type": source_type,
-            "date": str(message.date),
-            "link": message_link
-        }
+        msg_payload = build_message_payload(chat, message, text, source_type=source_type)
 
         qdrant.upsert(
             collection_name=MESSAGES_COLLECTION,
             points=[
                 PointStruct(
-                    id=msg_point_id, 
-                    vector=msg_embedding, 
+                    id=message_point_id(chat.id, message.id),
+                    vector=msg_embedding,
                     payload=msg_payload
                 )
             ]
@@ -559,9 +487,8 @@ async def answer_inline_query(client, inline_query):
             "- Never fabricate facts not found in the context."
         )
 
-        # 6. Synthesize with DeepSeek (offloaded to a thread)
-        ai_response = await asyncio.to_thread(
-            deepseek_client.chat.completions.create,
+        # 6. Synthesize with DeepSeek (async client)
+        ai_response = await deepseek_client.chat.completions.create(
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -601,32 +528,13 @@ async def historical_catchup():
             try:
                 chat = dialog.chat
                 chat_title = chat.title or chat.first_name or "Private Chat"
-                chat_username = chat.username or ""
 
                 # Skip noise channels (NSFW, memes, gambling, sticker-only, etc.)
                 if not await is_high_value_chat(chat):
                     continue
 
-                # 1. Upsert Chat Metadata into CHATS_COLLECTION (vectorized, offloaded to a thread)
-                chat_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chat_{chat.id}"))
-                chat_embed_text = f"Group: {chat_title}" + (f" (@{chat_username})" if chat_username else "")
-                chat_embedding = (await embed_texts([chat_embed_text]))[0].tolist()
-
-                qdrant.upsert(
-                    collection_name=CHATS_COLLECTION,
-                    points=[
-                        PointStruct(
-                            id=chat_point_id,
-                            vector=chat_embedding,
-                            payload={
-                                "chat_id": chat.id,
-                                "chat_title": chat_title,
-                                "chat_type": str(chat.type),
-                                "username": chat_username,
-                            }
-                        )
-                    ]
-                )
+                # 1. Upsert Chat Metadata into CHATS_COLLECTION (vectorized)
+                await upsert_chat(chat)
 
                 # 2. Fetch recent history (extract text, captions, OCR, documents)
                 messages_to_process = []
@@ -653,39 +561,12 @@ async def historical_catchup():
 
                 points = []
                 for (message, text, source_type), embedding in zip(messages_to_process, embeddings):
-                    # Sender extraction with full name and username handle
-                    if message.from_user:
-                        sender_id = message.from_user.id
-                        first_name = message.from_user.first_name or ""
-                        last_name = message.from_user.last_name or ""
-                        sender_name = f"{first_name} {last_name}".strip() or "Unknown"
-                        sender_username = message.from_user.username or ""
-                    else:
-                        sender_id = chat.id
-                        sender_name = chat_title
-                        sender_username = chat_username
-
-                    # Clean deep-link generation
-                    message_link = build_message_link(chat, message.id)
-
-                    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{chat.id}_{message.id}"))
-
+                    payload = build_message_payload(chat, message, text, source_type=source_type)
                     points.append(
                         PointStruct(
-                            id=point_id,
+                            id=message_point_id(chat.id, message.id),
                             vector=embedding.tolist(),
-                            payload={
-                                "message_id": message.id,
-                                "chat_id": chat.id,
-                                "chat_title": chat_title,
-                                "sender_id": sender_id,
-                                "sender_name": sender_name,
-                                "sender_username": sender_username,
-                                "text": text,
-                                "source_type": source_type,
-                                "date": str(message.date),
-                                "link": message_link
-                            }
+                            payload=payload
                         )
                     )
 
@@ -736,7 +617,6 @@ async def continuous_deep_scraper():
 
                 chat = dialog.chat
                 chat_title = chat.title or chat.first_name or "Private Chat"
-                chat_username = chat.username or ""
 
                 # Skip noise channels (NSFW, memes, gambling, sticker-only, etc.)
                 if not await is_high_value_chat(chat):
@@ -744,27 +624,7 @@ async def continuous_deep_scraper():
 
                 # Upsert chat metadata (vectorized)
                 try:
-                    chat_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chat_{chat.id}"))
-                    chat_embed_text = (
-                        f"Group: {chat_title}"
-                        + (f" (@{chat_username})" if chat_username else "")
-                    )
-                    chat_embedding = (await embed_texts([chat_embed_text]))[0].tolist()
-                    qdrant.upsert(
-                        collection_name=CHATS_COLLECTION,
-                        points=[
-                            PointStruct(
-                                id=chat_point_id,
-                                vector=chat_embedding,
-                                payload={
-                                    "chat_id": chat.id,
-                                    "chat_title": chat_title,
-                                    "chat_type": str(chat.type),
-                                    "username": chat_username,
-                                },
-                            )
-                        ],
-                    )
+                    await upsert_chat(chat)
                 except Exception as e:
                     print(f"Deep scraper: chat metadata error for {chat.id}: {e}")
 
@@ -802,41 +662,14 @@ async def continuous_deep_scraper():
 
                         points = []
                         for (message, text, source_type), embedding in zip(batch, embeddings):
-                            if message.from_user:
-                                sender_id = message.from_user.id
-                                first_name = message.from_user.first_name or ""
-                                last_name = message.from_user.last_name or ""
-                                sender_name = (
-                                    f"{first_name} {last_name}".strip() or "Unknown"
-                                )
-                                sender_username = message.from_user.username or ""
-                            else:
-                                sender_id = chat.id
-                                sender_name = chat_title
-                                sender_username = chat_username
-
-                            message_link = build_message_link(chat, message.id)
-                            point_id = str(
-                                uuid.uuid5(
-                                    uuid.NAMESPACE_DNS, f"{chat.id}_{message.id}"
-                                )
+                            payload = build_message_payload(
+                                chat, message, text, source_type=source_type
                             )
                             points.append(
                                 PointStruct(
-                                    id=point_id,
+                                    id=message_point_id(chat.id, message.id),
                                     vector=embedding.tolist(),
-                                    payload={
-                                        "message_id": message.id,
-                                        "chat_id": chat.id,
-                                        "chat_title": chat_title,
-                                        "sender_id": sender_id,
-                                        "sender_name": sender_name,
-                                        "sender_username": sender_username,
-                                        "text": text,
-                                        "source_type": source_type,
-                                        "date": str(message.date),
-                                        "link": message_link,
-                                    },
+                                    payload=payload,
                                 )
                             )
 
