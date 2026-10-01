@@ -5,6 +5,7 @@ fastembed
 pyrogram
 tgcrypto
 openai
+tenacity
 
 # Multi-modal extraction (optional but used by start.py)
 pytesseract
