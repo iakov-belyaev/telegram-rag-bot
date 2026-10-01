@@ -16,8 +16,12 @@ load_dotenv()
 # --- Configuration & Limits ---
 MESSAGES_COLLECTION = "telegram_messages"
 CHATS_COLLECTION = "telegram_chats"
-MAX_POINTS_WARN_THRESHOLD = 800_000  # Qdrant free tier ~1M vector capacity warning limit
+MAX_VECTORS = int(os.getenv("MAX_VECTORS", "100000"))  # Hard capacity ceiling for the messages collection
+STORAGE_WARN_RATIO = 0.80   # Send a DM notification at 80% capacity
+STORAGE_PAUSE_RATIO = 0.95  # Pause background scraping at 95% capacity
 STORAGE_CHECK_INTERVAL_SECONDS = 3600  # Check DB capacity every hour
+SCRAPER_IDLE_SLEEP_SECONDS = 300  # Sleep between full deep-scrape passes
+SCRAPER_PAGE_SIZE = 100  # Messages fetched per history page
 
 print("🚀 Initializing components...")
 
@@ -55,6 +59,10 @@ inline_bot = Client(
 ADMIN_USER_ID = None
 alert_sent = False
 
+# Set to True by StorageShield when capacity crosses the pause threshold.
+# Background scrapers check this flag and stop ingesting new points.
+scraping_paused = False
+
 
 def build_message_link(chat, message_id):
     """Build a correct Telegram deep-link for private chats, groups, and channels."""
@@ -68,6 +76,90 @@ def build_message_link(chat, message_id):
 async def embed_texts(texts):
     """Run the synchronous FastEmbed model in a worker thread to avoid blocking the event loop."""
     return await asyncio.to_thread(lambda: list(embedding_model.embed(texts)))
+
+
+# ==========================================
+# 0. STORAGE SHIELD (capacity guard)
+# ==========================================
+async def StorageShield():
+    """Check the messages collection size against MAX_VECTORS.
+
+    - At >= 80% capacity: send a one-time Telegram DM warning.
+    - At >= 95% capacity: set `scraping_paused = True` so background scrapers stop.
+    - Below 80%: reset the alert flag so future warnings can fire again.
+    """
+    global alert_sent, scraping_paused
+    try:
+        collection_info = await asyncio.to_thread(
+            qdrant.get_collection, MESSAGES_COLLECTION
+        )
+        # Prefer vectors_count; fall back to points_count if unavailable.
+        vectors_count = (
+            getattr(collection_info, "vectors_count", None)
+            or getattr(collection_info, "points_count", None)
+            or 0
+        )
+
+        usage_ratio = vectors_count / MAX_VECTORS if MAX_VECTORS else 0.0
+        print(
+            f"🛡️ StorageShield: {vectors_count:,}/{MAX_VECTORS:,} vectors "
+            f"({usage_ratio * 100:.1f}% capacity)."
+        )
+
+        # --- Pause threshold (95%) ---
+        if usage_ratio >= STORAGE_PAUSE_RATIO:
+            if not scraping_paused:
+                scraping_paused = True
+                print("⛔ StorageShield: capacity >= 95%, pausing background scraping.")
+                if ADMIN_USER_ID:
+                    try:
+                        await inline_bot.send_message(
+                            chat_id=ADMIN_USER_ID,
+                            text=(
+                                f"⛔ **SCRAPING PAUSED — STORAGE CRITICAL**\n\n"
+                                f"Vectors: `{vectors_count:,}` / `{MAX_VECTORS:,}` "
+                                f"({usage_ratio * 100:.1f}%)\n"
+                                f"Background ingestion has been paused to protect the cluster.\n"
+                                f"Please purge old messages or upgrade your Qdrant plan."
+                            ),
+                        )
+                    except errors.PeerIdInvalid:
+                        print("⚠️ Cannot DM admin (PeerIdInvalid). Click /start on the bot.")
+                    except Exception as e:
+                        print(f"⚠️ Failed to send pause alert: {e}")
+
+        # --- Warning threshold (80%) ---
+        elif usage_ratio >= STORAGE_WARN_RATIO:
+            if not alert_sent:
+                alert_sent = True
+                print("⚠️ StorageShield: capacity >= 80%, sending warning DM.")
+                if ADMIN_USER_ID:
+                    try:
+                        await inline_bot.send_message(
+                            chat_id=ADMIN_USER_ID,
+                            text=(
+                                f"⚠️ **QDRANT STORAGE WARNING** ⚠️\n\n"
+                                f"Your database is approaching its capacity limit!\n"
+                                f"Vectors: `{vectors_count:,}` / `{MAX_VECTORS:,}` "
+                                f"({usage_ratio * 100:.1f}%)\n"
+                                f"Scraping will pause automatically at "
+                                f"{int(STORAGE_PAUSE_RATIO * 100)}%."
+                            ),
+                        )
+                    except errors.PeerIdInvalid:
+                        print("⚠️ Cannot DM admin (PeerIdInvalid). Click /start on the bot.")
+                    except Exception as e:
+                        print(f"⚠️ Failed to send warning alert: {e}")
+
+        # --- Healthy range: reset flags so alerts can fire again later ---
+        else:
+            if alert_sent:
+                alert_sent = False
+            if scraping_paused:
+                scraping_paused = False
+                print("✅ StorageShield: capacity back under 95%, resuming scraping.")
+    except Exception as e:
+        print(f"StorageShield error: {e}")
 
 # ==========================================
 # 1. REAL-TIME USERBOT LISTENER
@@ -350,40 +442,149 @@ async def historical_catchup():
     print("✅ Background historical catch-up sync complete.")
 
 # ==========================================
-# 4. CAPACITY & OVERFILL NOTIFIER
+# 4. CAPACITY MONITOR (delegates to StorageShield)
 # ==========================================
 async def monitor_qdrant_capacity():
-    global alert_sent
     while True:
+        await StorageShield()
+        await asyncio.sleep(STORAGE_CHECK_INTERVAL_SECONDS)
+
+
+# ==========================================
+# 5. CONTINUOUS DEEP BACKGROUND SCRAPER
+# ==========================================
+async def continuous_deep_scraper():
+    """Continuously walk every dialog and paginate deep history.
+
+    Runs forever, sleeping between full passes. Respects `scraping_paused`
+    set by StorageShield and backs off on FloodWait.
+    """
+    print("🕳️ Continuous deep scraper started.")
+    while True:
+        if scraping_paused:
+            print("⏸️ Deep scraper idle: storage paused.")
+            await asyncio.sleep(SCRAPER_IDLE_SLEEP_SECONDS)
+            continue
+
         try:
-            collection_info = qdrant.get_collection(MESSAGES_COLLECTION)
-            points_count = collection_info.points_count or 0
+            async for dialog in userbot.get_dialogs():
+                if scraping_paused:
+                    print("⏸️ Deep scraper stopping pass: storage paused.")
+                    break
 
-            print(f"📊 Storage Check: Currently holding {points_count:,} vectors in Qdrant.")
+                chat = dialog.chat
+                chat_title = chat.title or chat.first_name or "Private Chat"
+                chat_username = chat.username or ""
 
-            if points_count >= MAX_POINTS_WARN_THRESHOLD and not alert_sent:
-                alert_text = (
-                    f"⚠️ **QDRANT STORAGE WARNING** ⚠️️\n\n"
-                    f"Your database is approaching its capacity limit!\n"
-                    f"Current Indexed Messages: `{points_count:,}`\n"
-                    f"Threshold Warning Level: `{MAX_POINTS_WARN_THRESHOLD:,}`\n\n"
-                    f"Please purge old messages or upgrade your Qdrant cluster."
-                )
-                if ADMIN_USER_ID:
+                # Upsert chat metadata (vectorized)
+                try:
+                    chat_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chat_{chat.id}"))
+                    chat_embed_text = (
+                        f"Group: {chat_title}"
+                        + (f" (@{chat_username})" if chat_username else "")
+                    )
+                    chat_embedding = (await embed_texts([chat_embed_text]))[0].tolist()
+                    qdrant.upsert(
+                        collection_name=CHATS_COLLECTION,
+                        points=[
+                            PointStruct(
+                                id=chat_point_id,
+                                vector=chat_embedding,
+                                payload={
+                                    "chat_id": chat.id,
+                                    "chat_title": chat_title,
+                                    "chat_type": str(chat.type),
+                                    "username": chat_username,
+                                },
+                            )
+                        ],
+                    )
+                except Exception as e:
+                    print(f"Deep scraper: chat metadata error for {chat.id}: {e}")
+
+                # Paginate deep history
+                offset_id = 0
+                while True:
+                    if scraping_paused:
+                        break
                     try:
-                        await inline_bot.send_message(chat_id=ADMIN_USER_ID, text=alert_text)
-                        print(f"🔔 Overfill alert dispatched to user ID {ADMIN_USER_ID}")
-                        alert_sent = True
-                    except errors.PeerIdInvalid:
-                        print(f"⚠️ Storage alert triggered ({points_count:,} points), but bot cannot message user {ADMIN_USER_ID} until you click /start in Telegram.")
+                        batch = []
+                        async for message in userbot.get_chat_history(
+                            chat.id, limit=SCRAPER_PAGE_SIZE, offset_id=offset_id
+                        ):
+                            raw_text = message.text or message.caption or ""
+                            clean_text = raw_text.strip()
+                            if len(clean_text) >= 10:
+                                batch.append((message, clean_text))
+                            offset_id = message.id
 
-            elif points_count < MAX_POINTS_WARN_THRESHOLD and alert_sent:
-                alert_sent = False
+                        if not batch:
+                            break
+
+                        texts = [item[1] for item in batch]
+                        embeddings = await embed_texts(texts)
+
+                        points = []
+                        for (message, text), embedding in zip(batch, embeddings):
+                            if message.from_user:
+                                sender_id = message.from_user.id
+                                first_name = message.from_user.first_name or ""
+                                last_name = message.from_user.last_name or ""
+                                sender_name = (
+                                    f"{first_name} {last_name}".strip() or "Unknown"
+                                )
+                                sender_username = message.from_user.username or ""
+                            else:
+                                sender_id = chat.id
+                                sender_name = chat_title
+                                sender_username = chat_username
+
+                            message_link = build_message_link(chat, message.id)
+                            point_id = str(
+                                uuid.uuid5(
+                                    uuid.NAMESPACE_DNS, f"{chat.id}_{message.id}"
+                                )
+                            )
+                            points.append(
+                                PointStruct(
+                                    id=point_id,
+                                    vector=embedding.tolist(),
+                                    payload={
+                                        "message_id": message.id,
+                                        "chat_id": chat.id,
+                                        "chat_title": chat_title,
+                                        "sender_id": sender_id,
+                                        "sender_name": sender_name,
+                                        "sender_username": sender_username,
+                                        "text": text,
+                                        "date": str(message.date),
+                                        "link": message_link,
+                                    },
+                                )
+                            )
+
+                        qdrant.upsert(
+                            collection_name=MESSAGES_COLLECTION, points=points
+                        )
+                        await asyncio.sleep(0.2)
+
+                        if len(batch) < SCRAPER_PAGE_SIZE:
+                            break
+                    except errors.FloodWait as e:
+                        print(
+                            f"⚠️ Deep scraper FloodWait on chat {chat.id}, "
+                            f"sleeping {e.value}s..."
+                        )
+                        await asyncio.sleep(e.value)
+                    except Exception as e:
+                        print(f"Deep scraper: history error for chat {chat.id}: {e}")
+                        break
 
         except Exception as e:
-            print(f"Error checking Qdrant capacity: {e}")
+            print(f"Deep scraper pass error: {e}")
 
-        await asyncio.sleep(STORAGE_CHECK_INTERVAL_SECONDS)
+        print("✅ Deep scraper pass complete. Sleeping before next pass...")
+        await asyncio.sleep(SCRAPER_IDLE_SLEEP_SECONDS)
 
 
 # ==========================================
@@ -421,6 +622,7 @@ async def main():
         print(f"Notice: Could not send startup message: {e}")
 
     asyncio.create_task(historical_catchup())
+    asyncio.create_task(continuous_deep_scraper())
     asyncio.create_task(monitor_qdrant_capacity())
 
     print("🟢 All services online. Listening continuously...")
