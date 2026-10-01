@@ -1,0 +1,13 @@
+# Core
+python-dotenv
+qdrant-client
+fastembed
+pyrogram
+tgcrypto
+openai
+
+# Multi-modal extraction (optional but used by start.py)
+pytesseract
+pillow
+pypdf
+python-docx
