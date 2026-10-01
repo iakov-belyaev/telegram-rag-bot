@@ -61,8 +61,8 @@ async def scrape_and_vectorize():
 
                 # --- Step 2: Fetch and Filter Messages ---
                 messages_to_process = []
-                async for message in app.get_chat_history(chat.id, limit=200):
-                    if message.text and len(message.text.strip()) >= 10:
+                async for message in app.get_chat_history(chat.id, limit=450):
+                    if message.text and len(message.text.strip()) >= 5:
                         messages_to_process.append(message)
 
                 if not messages_to_process:
