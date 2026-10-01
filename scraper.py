@@ -13,6 +13,20 @@ load_dotenv()
 print("Loading FastEmbed model...")
 embedding_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
+
+def build_message_link(chat, message_id):
+    """Build a correct Telegram deep-link for private chats, groups, and channels."""
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}/{message_id}"
+    # Strip '-100' prefix from supergroup/channel IDs for web/app deep-linking
+    clean_chat_id = str(chat.id).replace("-100", "").replace("-", "")
+    return f"https://t.me/c/{clean_chat_id}/{message_id}"
+
+
+async def embed_texts(texts):
+    """Run the synchronous FastEmbed model in a worker thread to avoid blocking the event loop."""
+    return await asyncio.to_thread(lambda: list(embedding_model.embed(texts)))
+
 # 2. Connect to Qdrant Cloud
 qdrant = QdrantClient(
     url=os.getenv("QDRANT_URL"),
@@ -39,19 +53,24 @@ async def scrape_and_vectorize():
             print(f"\n--- Scraping Chat: {chat_title} (ID: {chat.id}) ---")
 
             try:
-                # --- Step 1: Register/Update Chat in 'telegram_chats' ---
+                chat_username = chat.username or ""
+
+                # --- Step 1: Register/Update Chat in 'telegram_chats' (vectorized) ---
                 chat_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chat_{chat.id}"))
+                chat_embed_text = f"Group: {chat_title}" + (f" (@{chat_username})" if chat_username else "")
+                chat_embedding = (await embed_texts([chat_embed_text]))[0].tolist()
+
                 qdrant.upsert(
                     collection_name=CHATS_COLLECTION,
                     points=[
                         PointStruct(
                             id=chat_point_id,
-                            vector=[0.0],  # Dummy vector for non-vector metadata storage
+                            vector=chat_embedding,
                             payload={
                                 "chat_id": chat.id,
                                 "chat_title": chat_title,
                                 "chat_type": str(chat.type),
-                                "username": chat.username or "",
+                                "username": chat_username,
                                 "members_count": getattr(chat, "members_count", 0),
                             }
                         )
@@ -69,21 +88,25 @@ async def scrape_and_vectorize():
                     print(f"No valid messages found in '{chat_title}'. Skipping vectorization.")
                     continue
 
-                # --- Step 3: Batch Vectorize Messages ---
+                # --- Step 3: Batch Vectorize Messages (offloaded to a thread) ---
                 texts = [m.text.strip() for m in messages_to_process]
-                embeddings = list(embedding_model.embed(texts))
+                embeddings = await embed_texts(texts)
 
                 # --- Step 4: Construct Points for Batch Upsert ---
                 points = []
                 for message, embedding in zip(messages_to_process, embeddings):
-                    sender_id = message.from_user.id if message.from_user else chat.id
-                    sender_name = message.from_user.first_name if message.from_user else "Unknown"
-                    message_link = (
-                        message.link 
-                        if hasattr(message, "link") and message.link 
-                        else f"https://t.me/c/{abs(chat.id)}/{message.id}"
-                    )
+                    if message.from_user:
+                        sender_id = message.from_user.id
+                        first_name = message.from_user.first_name or ""
+                        last_name = message.from_user.last_name or ""
+                        sender_name = f"{first_name} {last_name}".strip() or "Unknown"
+                        sender_username = message.from_user.username or ""
+                    else:
+                        sender_id = chat.id
+                        sender_name = chat_title
+                        sender_username = chat_username
 
+                    message_link = build_message_link(chat, message.id)
                     point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{chat.id}_{message.id}"))
 
                     payload = {
@@ -92,6 +115,7 @@ async def scrape_and_vectorize():
                         "chat_title": chat_title,
                         "sender_id": sender_id,
                         "sender_name": sender_name,
+                        "sender_username": sender_username,
                         "text": message.text.strip(),
                         "date": str(message.date),
                         "link": message_link

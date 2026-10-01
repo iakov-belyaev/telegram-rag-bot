@@ -1,3 +1,4 @@
+import asyncio
 import os
 from dotenv import load_dotenv
 from fastembed import TextEmbedding
@@ -11,6 +12,11 @@ load_dotenv()
 # 1. Load FastEmbed Model
 print("Loading FastEmbed model for inline search...")
 embedding_model = TextEmbedding(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+
+async def embed_texts(texts):
+    """Run the synchronous FastEmbed model in a worker thread to avoid blocking the event loop."""
+    return await asyncio.to_thread(lambda: list(embedding_model.embed(texts)))
 
 # 2. Qdrant Client
 qdrant = QdrantClient(
@@ -39,15 +45,16 @@ async def answer_inline_query(client, inline_query):
         return
 
     try:
-        # Step 1: Embed search query
-        query_vector = list(embedding_model.embed([query_text]))[0].tolist()
+        # Step 1: Embed search query (offloaded to a thread)
+        query_vector = (await embed_texts([query_text]))[0].tolist()
 
         # Step 2: Search top 5 relevant messages in Qdrant
-        search_results = qdrant.search(
+        search_response = qdrant.query_points(
             collection_name="telegram_messages",
-            query_vector=query_vector,
+            query=query_vector,
             limit=5
         )
+        search_results = search_response.points
 
         if not search_results:
             return
@@ -62,15 +69,16 @@ async def answer_inline_query(client, inline_query):
         context_str = "\n".join(context_lines)
 
         try:
-            ai_response = deepseek_client.chat.completions.create(
+            ai_response = await asyncio.to_thread(
+                deepseek_client.chat.completions.create,
                 model="deepseek-chat",
                 messages=[
                     {
-                        "role": "system", 
+                        "role": "system",
                         "content": "You are a concise assistant summarizing facts retrieved from a user's Telegram chat history. Answer accurately using only the context provided."
                     },
                     {
-                        "role": "user", 
+                        "role": "user",
                         "content": f"Context messages:\n{context_str}\n\nQuestion: {query_text}"
                     }
                 ],

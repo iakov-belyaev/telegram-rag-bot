@@ -24,11 +24,11 @@ if not client.collection_exists("telegram_messages"):
     )
     print("Collection 'telegram_messages' created.")
 
-# 2. Collection for frontend group lookup
+# 2. Collection for frontend group lookup (vectorized so chats are semantically searchable)
 if not client.collection_exists("telegram_chats"):
     client.create_collection(
         collection_name="telegram_chats",
-        # Small dummy vector required by Qdrant (size 1) for non-vector metadata storage
-        vectors_config=VectorParams(size=1, distance=Distance.COSINE),
+        # 384 dimensions to match the FastEmbed all-MiniLM-L6-v2 model
+        vectors_config=VectorParams(size=384, distance=Distance.COSINE),
     )
     print("Collection 'telegram_chats' created.")

@@ -55,6 +55,20 @@ inline_bot = Client(
 ADMIN_USER_ID = None
 alert_sent = False
 
+
+def build_message_link(chat, message_id):
+    """Build a correct Telegram deep-link for private chats, groups, and channels."""
+    if getattr(chat, "username", None):
+        return f"https://t.me/{chat.username}/{message_id}"
+    # Strip '-100' prefix from supergroup/channel IDs for web/app deep-linking
+    clean_chat_id = str(chat.id).replace("-100", "").replace("-", "")
+    return f"https://t.me/c/{clean_chat_id}/{message_id}"
+
+
+async def embed_texts(texts):
+    """Run the synchronous FastEmbed model in a worker thread to avoid blocking the event loop."""
+    return await asyncio.to_thread(lambda: list(embedding_model.embed(texts)))
+
 # ==========================================
 # 1. REAL-TIME USERBOT LISTENER
 # ==========================================
@@ -84,17 +98,12 @@ async def process_incoming_message(client, message):
             sender_username = chat_username
 
         # 3. Format Telegram deep-link correctly
-        if chat_username:
-            message_link = f"https://t.me/{chat_username}/{message.id}"
-        else:
-            # Strip '-100' prefix from private supergroup/channel IDs for web/app deep-linking
-            clean_chat_id = str(chat.id).replace("-100", "").replace("-", "")
-            message_link = f"https://t.me/c/{clean_chat_id}/{message.id}"
+        message_link = build_message_link(chat, message.id)
 
         # 4. Upsert Chat Metadata (Vectorized so CHATS_COLLECTION is semantically searchable)
         chat_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chat_{chat.id}"))
         chat_embed_text = f"Group: {chat_title}" + (f" (@{chat_username})" if chat_username else "")
-        chat_embedding = list(embedding_model.embed([chat_embed_text]))[0].tolist()
+        chat_embedding = (await embed_texts([chat_embed_text]))[0].tolist()
 
         qdrant.upsert(
             collection_name=CHATS_COLLECTION,
@@ -112,8 +121,8 @@ async def process_incoming_message(client, message):
             ]
         )
 
-        # 5. Embed message and store full payload
-        msg_embedding = list(embedding_model.embed([text]))[0].tolist()
+        # 5. Embed message and store full payload (offloaded to a thread)
+        msg_embedding = (await embed_texts([text]))[0].tolist()
         msg_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{chat.id}_{message.id}"))
 
         msg_payload = {
@@ -152,8 +161,8 @@ async def answer_inline_query(client, inline_query):
         return
 
     try:
-        # 1. Embed user query
-        query_vector = list(embedding_model.embed([query_text]))[0].tolist()
+        # 1. Embed user query (offloaded to a thread)
+        query_vector = (await embed_texts([query_text]))[0].tolist()
 
         # 2. Retrieve relevant message history
         msg_response = qdrant.query_points(
@@ -210,8 +219,9 @@ async def answer_inline_query(client, inline_query):
             "- Never fabricate facts not found in the context."
         )
 
-        # 6. Synthesize with DeepSeek
-        ai_response = deepseek_client.chat.completions.create(
+        # 6. Synthesize with DeepSeek (offloaded to a thread)
+        ai_response = await asyncio.to_thread(
+            deepseek_client.chat.completions.create,
             model="deepseek-chat",
             messages=[
                 {"role": "system", "content": system_prompt},
@@ -253,10 +263,10 @@ async def historical_catchup():
                 chat_title = chat.title or chat.first_name or "Private Chat"
                 chat_username = chat.username or ""
 
-                # 1. Upsert Chat Metadata into CHATS_COLLECTION (vectorized)
+                # 1. Upsert Chat Metadata into CHATS_COLLECTION (vectorized, offloaded to a thread)
                 chat_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chat_{chat.id}"))
                 chat_embed_text = f"Group: {chat_title}" + (f" (@{chat_username})" if chat_username else "")
-                chat_embedding = list(embedding_model.embed([chat_embed_text]))[0].tolist()
+                chat_embedding = (await embed_texts([chat_embed_text]))[0].tolist()
 
                 qdrant.upsert(
                     collection_name=CHATS_COLLECTION,
@@ -286,7 +296,7 @@ async def historical_catchup():
                     continue
 
                 texts = [item[1] for item in messages_to_process]
-                embeddings = list(embedding_model.embed(texts))
+                embeddings = await embed_texts(texts)
 
                 points = []
                 for (message, text), embedding in zip(messages_to_process, embeddings):
@@ -303,11 +313,7 @@ async def historical_catchup():
                         sender_username = chat_username
 
                     # Clean deep-link generation
-                    if chat_username:
-                        message_link = f"https://t.me/{chat_username}/{message.id}"
-                    else:
-                        clean_chat_id = str(chat.id).replace("-100", "").replace("-", "")
-                        message_link = f"https://t.me/c/{clean_chat_id}/{message.id}"
+                    message_link = build_message_link(chat, message.id)
 
                     point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{chat.id}_{message.id}"))
 
