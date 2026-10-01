@@ -59,6 +59,27 @@ inline_bot = Client(
 ADMIN_USER_ID = None
 alert_sent = False
 
+# --- Noise channel filtering ---
+# Regex patterns matched (case-insensitive) against chat title + username.
+# Any match marks the chat as low-value noise and it is skipped by the scraper.
+NOISE_TITLE_PATTERNS = [
+    r"\bnsfw\b", r"\bxxx\b", r"\bporn", r"\bsex\b", r"\bhentai\b", r"\b18\+",
+    r"\badult\b", r"\berotic\b", r"\bnude", r"\bonlyfans\b",
+    r"\bmeme", r"\bмем", r"\bприкол", r"\bjoke", r"\bfunny\b", r"\bhumor\b",
+    r"\bgambl", r"\bcasino\b", r"\bbet\b", r"\bbetting\b", r"\bказино\b",
+    r"\bsticker", r"\bстикер", r"\bemoji", r"\bсмайл",
+    r"\bairdrop\b", r"\bcrypto\s*signal", r"\bpump\b", r"\bscam\b",
+]
+NOISE_TITLE_REGEX = re.compile("|".join(NOISE_TITLE_PATTERNS), re.IGNORECASE)
+
+# Minimum fraction of text-bearing messages required to consider a chat high-value.
+# Chats dominated by media/stickers with little text are treated as noise.
+MIN_TEXT_RATIO = 0.30
+# Number of recent messages sampled to compute the text-to-media ratio.
+FILTER_SAMPLE_SIZE = 30
+# Minimum number of sampled messages required before trusting the ratio.
+FILTER_MIN_SAMPLES = 10
+
 # Set to True by StorageShield when capacity crosses the pause threshold.
 # Background scrapers check this flag and stop ingesting new points.
 scraping_paused = False
@@ -76,6 +97,66 @@ def build_message_link(chat, message_id):
 async def embed_texts(texts):
     """Run the synchronous FastEmbed model in a worker thread to avoid blocking the event loop."""
     return await asyncio.to_thread(lambda: list(embedding_model.embed(texts)))
+
+
+async def is_high_value_chat(chat):
+    """Decide whether a chat is worth scraping.
+
+    Returns True for high-value chats, False for noise (NSFW, porn, memes,
+    gambling, sticker-only, or broadcast-only channels).
+
+    Heuristics:
+      1. Title/username regex match against known noise keywords.
+      2. Broadcast-only channels (no meaningful sender variety) are skipped.
+      3. Text-to-media ratio over recent history: chats dominated by
+         stickers/media with little text are treated as noise.
+    """
+    chat_title = chat.title or chat.first_name or ""
+    chat_username = chat.username or ""
+    haystack = f"{chat_title} {chat_username}"
+
+    # 1. Title / username keyword filter
+    match = NOISE_TITLE_REGEX.search(haystack)
+    if match:
+        print(
+            f"🚫 Skipping noise chat '{chat_title}' "
+            f"(matched pattern: '{match.group(0)}')"
+        )
+        return False
+
+    # 2. Broadcast-only channels: skip channels where messages have no
+    #    from_user (pure broadcast) — they add little conversational value.
+    if str(chat.type) == "ChatType.CHANNEL":
+        print(f"🚫 Skipping broadcast-only channel '{chat_title}'")
+        return False
+
+    # 3. Sample recent history to compute text-to-media ratio
+    try:
+        total = 0
+        text_bearing = 0
+        async for message in userbot.get_chat_history(
+            chat.id, limit=FILTER_SAMPLE_SIZE
+        ):
+            total += 1
+            raw_text = message.text or message.caption or ""
+            if len(raw_text.strip()) >= 10:
+                text_bearing += 1
+
+        if total >= FILTER_MIN_SAMPLES:
+            ratio = text_bearing / total
+            if ratio < MIN_TEXT_RATIO:
+                print(
+                    f"🚫 Skipping low-text chat '{chat_title}' "
+                    f"(text ratio {ratio:.2f} < {MIN_TEXT_RATIO})"
+                )
+                return False
+    except errors.FloodWait as e:
+        print(f"⚠️ FloodWait while filtering '{chat_title}', sleeping {e.value}s...")
+        await asyncio.sleep(e.value)
+    except Exception as e:
+        print(f"⚠️ Filter sample error for '{chat_title}': {e}")
+
+    return True
 
 
 # ==========================================
@@ -355,6 +436,10 @@ async def historical_catchup():
                 chat_title = chat.title or chat.first_name or "Private Chat"
                 chat_username = chat.username or ""
 
+                # Skip noise channels (NSFW, memes, gambling, sticker-only, etc.)
+                if not await is_high_value_chat(chat):
+                    continue
+
                 # 1. Upsert Chat Metadata into CHATS_COLLECTION (vectorized, offloaded to a thread)
                 chat_point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"chat_{chat.id}"))
                 chat_embed_text = f"Group: {chat_title}" + (f" (@{chat_username})" if chat_username else "")
@@ -475,6 +560,10 @@ async def continuous_deep_scraper():
                 chat = dialog.chat
                 chat_title = chat.title or chat.first_name or "Private Chat"
                 chat_username = chat.username or ""
+
+                # Skip noise channels (NSFW, memes, gambling, sticker-only, etc.)
+                if not await is_high_value_chat(chat):
+                    continue
 
                 # Upsert chat metadata (vectorized)
                 try:
