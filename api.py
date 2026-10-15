@@ -9,22 +9,21 @@ from __future__ import annotations
 import asyncio
 import hmac
 import time
-from typing import Awaitable, Callable, Optional
+from typing import Any, Callable, Coroutine, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 import config
-import database as db
 import metrics as metrics_lib
-import profiles
 import scraper
+import storage as db
 
 _START_TIME = time.monotonic()
 
 # Wired by main.py to an async callable that performs a profile sweep.
-_sweep_fn: Optional[Callable[[], Awaitable[dict]]] = None
+_sweep_fn: Optional[Callable[[], Coroutine[Any, Any, dict]]] = None
 
 
 class ScraperAction(BaseModel):
@@ -33,6 +32,11 @@ class ScraperAction(BaseModel):
 
 class JoinRequest(BaseModel):
     peer: str
+
+
+class QueryRequest(BaseModel):
+    query: str
+    limit: Optional[int] = None
 
 
 async def _require_token(authorization: str = Header(default="")) -> None:
@@ -74,11 +78,12 @@ def create_app() -> FastAPI:
             return {
                 "scraper": control.status(),
                 "config": config.config_summary(),
+                "failover": db.storage_status() if hasattr(db, "storage_status") else {},
             }
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=str(e)[:200])
+            raise HTTPException(status_code=500, detail=str(e)[:200]) from e
 
     @app.get("/metrics", dependencies=[Depends(_require_token)])
     async def metrics() -> dict:
@@ -96,7 +101,21 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=str(e)[:200])
+            raise HTTPException(status_code=500, detail=str(e)[:200]) from e
+
+    @app.post("/query", dependencies=[Depends(_require_token)])
+    async def run_query(payload: QueryRequest) -> dict:
+        try:
+            text = (payload.query or "").strip()
+            if not text:
+                raise HTTPException(status_code=400, detail="query must not be empty")
+            import query as query_lib
+
+            return await query_lib.dossier(text, limit=payload.limit)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(e)[:200]) from e
 
     @app.get("/prometheus", dependencies=[Depends(_require_token)])
     async def prometheus() -> PlainTextResponse:
@@ -105,7 +124,7 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=str(e)[:200])
+            raise HTTPException(status_code=500, detail=str(e)[:200]) from e
 
     @app.post("/control/scraper", dependencies=[Depends(_require_token)])
     async def control_scraper(payload: ScraperAction) -> dict:
@@ -124,7 +143,7 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=str(e)[:200])
+            raise HTTPException(status_code=500, detail=str(e)[:200]) from e
 
     @app.post("/control/join", dependencies=[Depends(_require_token)])
     async def control_join(payload: JoinRequest) -> dict:
@@ -139,7 +158,7 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=str(e)[:200])
+            raise HTTPException(status_code=500, detail=str(e)[:200]) from e
 
     @app.post("/control/sweep", dependencies=[Depends(_require_token)])
     async def control_sweep() -> dict:
@@ -154,7 +173,7 @@ def create_app() -> FastAPI:
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(status_code=500, detail=str(e)[:200])
+            raise HTTPException(status_code=500, detail=str(e)[:200]) from e
 
     return app
 

@@ -258,6 +258,7 @@ EXPORT_DIR: Path = STATE_DIR / "exports"
 
 WATCHLIST_FILE: Path = STATE_DIR / "watchlist.json"
 WATCHLIST_HITS_FILE: Path = STATE_DIR / "watchlist_hits.jsonl"
+WATCHLIST_FLUSH_SECONDS: int = _env_int("WATCHLIST_FLUSH_SECONDS", 60)
 
 # --- Control flags (kill switch / remote pause) ---
 
@@ -368,6 +369,7 @@ def config_summary() -> dict:
         "failover_enabled": FAILOVER_ENABLED,
         "discovery_enabled": DISCOVERY_ENABLED,
         "quality_llm_enabled": QUALITY_LLM_ENABLED,
+        "watchlist_flush_seconds": WATCHLIST_FLUSH_SECONDS,
         "log_level": LOG_LEVEL,
         "dedup_enabled": DEDUP_ENABLED,
         "admin_secret_set": bool(ADMIN_SECRET),

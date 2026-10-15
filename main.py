@@ -1,13 +1,13 @@
 """Unified async orchestrator for telegram-rag-bot v2.
 
 Starts the Pyrogram userbot + global bot, parallel scraper, profile sweeps,
-FastAPI control surface, and the StorageShield capacity guard; handles graceful
-shutdown on SIGINT/SIGTERM.
+FastAPI control surface, StorageShield capacity guard, autonomous discovery
+agent, scheduler (watchlist flushing), and the remote control-flag watchdog;
+handles graceful shutdown on SIGINT/SIGTERM with storage flush.
 """
 
 import asyncio
 import signal
-import sys
 import time
 
 from pyrogram import Client, errors
@@ -15,9 +15,14 @@ from pyrogram import Client, errors
 import api
 import bot as bot_mod
 import config
-import database as db
+import control_cli
+import discovery
+import logging_config
 import profiles
+import scheduler as scheduler_mod
 import scraper
+import storage as db
+import watchlist
 
 
 def log(message: str) -> None:
@@ -55,7 +60,9 @@ async def storage_shield(bot_client: Client, admin_id: int, control) -> None:
     while not control.stop_requested:
         try:
             stats = await db.collection_stats()
-            usage = stats["messages_usage"]["usage_ratio"]
+            usage = (stats.get("messages_usage") or {}).get("usage_ratio")
+            if usage is None:
+                raise ValueError("collection_stats missing messages_usage")
 
             if usage >= config.STORAGE_PAUSE_RATIO and not control.paused:
                 control.pause("storage:high-water")
@@ -91,6 +98,41 @@ async def storage_shield(bot_client: Client, admin_id: int, control) -> None:
             raise
 
 
+async def _control_watchdog(control) -> None:
+    """Poll state/control_flags.json and apply remote pause/resume/stop."""
+    watcher = control_cli.FlagWatcher()
+    last_applied = None
+    while not control.stop_requested:
+        try:
+            applied = watcher.apply(control)
+            if applied and applied != last_applied:
+                log(f"control flags applied: {applied}")
+            last_applied = applied
+        except Exception as exc:  # noqa: BLE001
+            log(f"control watchdog error: {exc}")
+        try:
+            await asyncio.sleep(config.CONTROL_FLAG_POLL_SECONDS)
+        except asyncio.CancelledError:
+            raise
+
+
+def _watchlist_job(bot_client: Client, admin_id: int):
+    """Zero-arg async job for the scheduler: deliver queued watchlist hits."""
+
+    async def _flush() -> None:
+        async def send_fn(text: str) -> None:
+            await _notify_admin(bot_client, admin_id, text)
+
+        try:
+            delivered = await watchlist.drain_hits(send_fn)
+            if delivered:
+                log(f"watchlist: delivered {delivered} hit(s)")
+        except Exception as exc:  # noqa: BLE001
+            log(f"watchlist flush failed: {exc}")
+
+    return _flush
+
+
 def _make_sweep_fn(userbot: Client):
     async def _sweep() -> dict:
         control = scraper.get_control()
@@ -110,6 +152,7 @@ async def main() -> int:
         return 1
 
     config.ensure_state_dir()
+    logging_config.setup_logging()
 
     userbot, bot_client = _build_clients()
 
@@ -120,6 +163,14 @@ async def main() -> int:
 
         bot_mod.register_handlers(bot_client, admin_id)
         await bot_client.start()
+    except errors.Unauthorized as exc:
+        log(f"userbot session rejected by Telegram ({exc}). Interactive re-login required:")
+        log(
+            '  python -c "from pyrogram import Client; import config; '
+            "Client(config.SESSION_USERBOT, api_id=config.TELEGRAM_API_ID, "
+            'api_hash=config.TELEGRAM_API_HASH).run()"'
+        )
+        return 2
     except Exception as exc:  # noqa: BLE001
         log(f"startup failed: {exc}")
         try:
@@ -134,6 +185,8 @@ async def main() -> int:
 
     api._sweep_fn = _make_sweep_fn(userbot)
 
+    await db.start_storage()
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
@@ -143,20 +196,38 @@ async def main() -> int:
             pass
 
     control = scraper.get_control()
+    scheduler = scheduler_mod.Scheduler(control=control)
+    scheduler.add(
+        "watchlist_flush",
+        config.WATCHLIST_FLUSH_SECONDS,
+        _watchlist_job(bot_client, admin_id),
+        run_immediately=False,
+    )
     tasks = [
         asyncio.create_task(scraper.run_scraper(userbot), name="scraper"),
         asyncio.create_task(profiles.profile_sweep(userbot, control), name="profiles"),
         asyncio.create_task(api.run_api(config.API_HOST, config.API_PORT), name="api"),
-        asyncio.create_task(
-            storage_shield(bot_client, admin_id, control), name="storage-shield"
-        ),
+        asyncio.create_task(storage_shield(bot_client, admin_id, control), name="storage-shield"),
+        asyncio.create_task(_control_watchdog(control), name="control-watchdog"),
+        asyncio.create_task(scheduler.run(), name="scheduler"),
     ]
+    if config.DISCOVERY_ENABLED:
+        discovery_gate = getattr(control, "gate", None) or scraper.FloodGate()
+        discovery_rate = scraper.RateGate(config.TG_OPS_PER_SECOND, config.TG_OPS_BURST)
+        tasks.append(
+            asyncio.create_task(
+                discovery.run_discovery(userbot, discovery_gate, discovery_rate, control),
+                name="discovery",
+            )
+        )
 
     await _notify_admin(
         bot_client,
         admin_id,
         f"🚀 telegram-rag-bot v2 online\nBot: {config.BOT_USERNAME}\n"
         f"Admin id: {admin_id}\nWorkers: {config.SCRAPER_WORKERS}\n"
+        f"Storage: {db.storage_status().get('mode', 'unknown')}\n"
+        f"Discovery: {'on' if config.DISCOVERY_ENABLED else 'off'}\n"
         f"API: http://{config.API_HOST}:{config.API_PORT}/health",
     )
 
@@ -170,6 +241,11 @@ async def main() -> int:
     for t in tasks:
         t.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
+
+    try:
+        await db.stop_storage()
+    except Exception as exc:  # noqa: BLE001
+        log(f"storage stop error: {exc}")
 
     await _notify_admin(bot_client, admin_id, "🛑 telegram-rag-bot shutting down")
 

@@ -24,15 +24,14 @@ import yaml
 from pyrogram import errors as tg_errors
 
 import config
-import database as db
 import metrics
+import storage as db
 from logging_config import get_logger
 from quality import (
     GOOD,
     UNKNOWN,
     QualityCache,
     classify_chat,
-    label_allows_indexing,
 )
 from scraper import (
     FloodGate,
@@ -42,7 +41,6 @@ from scraper import (
     mute_chat,
     telegram_call,
 )
-
 
 _logger = get_logger("discovery")
 
@@ -147,7 +145,7 @@ def extract_tme_links(text: str) -> list[str]:
 # ==========================================
 # 2. DISCOVERY QUEUE (PERSISTENT, ATOMIC)
 # ==========================================
-def _atomic_write_json(path: str, data: Any) -> None:
+def _atomic_write_json(path: "str | Path", data: Any) -> None:
     """Write JSON to a temp file then os.replace atomically."""
     config.ensure_state_dir()
     tmp_path = f"{path}.tmp"
@@ -156,7 +154,7 @@ def _atomic_write_json(path: str, data: Any) -> None:
     os.replace(tmp_path, path)
 
 
-def _load_json(path: str, default: Any) -> Any:
+def _load_json(path: "str | Path", default: Any) -> Any:
     """Load JSON from path; return default on missing/corrupt file."""
     try:
         with open(path, "r", encoding="utf-8") as f:

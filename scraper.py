@@ -12,6 +12,7 @@ import random
 import re
 import tempfile
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
 
 from pyrogram import errors as tg_errors
@@ -19,8 +20,8 @@ from pyrogram import filters
 from qdrant_client.models import PointStruct
 
 import config
-import database as db
 import metrics
+import storage as db
 from logging_config import get_logger
 
 # --- Multi-modal extraction (optional dependencies) ---
@@ -236,7 +237,7 @@ def get_control() -> ScraperControl:
 # ==========================================
 # 4. JSON STATE STORES (ATOMIC WRITES)
 # ==========================================
-def _atomic_write_json(path: str, data: Any) -> None:
+def _atomic_write_json(path: "str | Path", data: Any) -> None:
     """Write JSON to a temp file then os.replace atomically."""
     config.ensure_state_dir()
     tmp_path = f"{path}.tmp"
@@ -245,7 +246,7 @@ def _atomic_write_json(path: str, data: Any) -> None:
     os.replace(tmp_path, path)
 
 
-def _load_json(path: str, default: Any) -> Any:
+def _load_json(path: "str | Path", default: Any) -> Any:
     """Load JSON from path; return default on missing/corrupt file."""
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -536,8 +537,7 @@ async def is_high_value_chat(client, gate: FloodGate, cache: ChatFilterCache, ch
     """
     # 0. Quality classifier verdict (lazy import avoids a module cycle)
     try:
-        from quality import GOOD, QualityCache
-        import config as _config
+        from quality import GOOD
 
         qcache = _quality_cache_singleton()
         verdict = qcache.get(chat.id)
@@ -603,7 +603,7 @@ def _ocr_image_bytes(image_bytes: bytes) -> str:
         log("⚠️ pytesseract/Pillow not installed — image OCR disabled.")
         return ""
     try:
-        image = Image.open(io.BytesIO(image_bytes))
+        image: Any = Image.open(io.BytesIO(image_bytes))
         if image.mode not in ("RGB", "L"):
             image = image.convert("RGB")
         return pytesseract.image_to_string(image, lang=config.OCR_LANGUAGES).strip()
@@ -755,8 +755,17 @@ async def index_messages_batch(client, gate: FloodGate, chat, messages: list) ->
                 vector=v,
                 payload=db.build_message_payload(chat, m, t, source_type=s),
             )
-            for (m, t, s), v in zip(candidates, vectors)
+            for (m, t, s), v in zip(candidates, vectors, strict=True)
         ]
+
+        # 3b. Watchlist scan — alert-only side channel; must never block ingest.
+        try:
+            import watchlist
+
+            for point in points:
+                await watchlist.check_payload(point.payload or {})
+        except Exception as e:  # noqa: BLE001
+            log(f"⚠️ watchlist scan failed: {e}")
 
         # 4. Ensure chat metadata exists, then upsert points.
         await db.upsert_chat(chat)
@@ -909,7 +918,9 @@ async def scraper_supervisor(
         control.queue_depth = queue.qsize()
 
         # 5. Spawn consumers.
-        async def _consumer(worker_name: str) -> None:
+        async def _consumer(worker_name: str, queue: asyncio.Queue = queue) -> None:
+            # bind this cycle's queue explicitly: the closure is recreated per
+            # scrape cycle and must never pick up a later cycle's queue.
             while not control.stop_requested:
                 try:
                     chat = queue.get_nowait()

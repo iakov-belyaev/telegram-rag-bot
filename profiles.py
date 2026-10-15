@@ -16,8 +16,8 @@ from typing import Any, Optional
 from pyrogram import errors as tg_errors
 
 import config
-import database as db
 import metrics
+import storage as db
 from scraper import FloodGate, RateGate, iterate_with_flood, telegram_call
 
 
@@ -77,9 +77,9 @@ def compute_common_chats(profile_a: dict, profile_b: dict) -> dict:
 
     title_map: dict[int, str] = {}
     if len(ids_a) == len(titles_a):
-        title_map.update({cid: t for cid, t in zip(ids_a, titles_a)})
+        title_map.update({cid: t for cid, t in zip(ids_a, titles_a, strict=True)})
     if len(ids_b) == len(titles_b):
-        for cid, t in zip(ids_b, titles_b):
+        for cid, t in zip(ids_b, titles_b, strict=True):
             title_map.setdefault(cid, t)
 
     titles = [title_map.get(cid, "") for cid in common]
@@ -572,7 +572,7 @@ async def upsert_relations_batch(payloads: list[dict]) -> int:
     try:
         texts = [db.build_relation_embed_text(p) for p in payloads]
         vectors = await db.embed_texts(texts)
-        pairs = list(zip(payloads, vectors))
+        pairs = list(zip(payloads, vectors, strict=True))
         return await db.upsert_relations(pairs)
     except Exception as e:
         log(f"⚠️ upsert_relations_batch failed: {e}")

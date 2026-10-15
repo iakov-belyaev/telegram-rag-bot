@@ -8,8 +8,9 @@ answers anywhere, deep OSINT gated behind the private admin challenge/response
 import asyncio
 import re
 import time
-from typing import Optional
+from typing import Any, Optional
 
+from openai import AsyncOpenAI
 from pyrogram import Client, filters
 from pyrogram.types import (
     InlineKeyboardButton,
@@ -19,11 +20,10 @@ from pyrogram.types import (
 )
 
 import config
-import database as db
 import profiles
-from openai import AsyncOpenAI
-from rbac import get_auth
 import scraper
+import storage as db
+from rbac import get_auth
 from scraper import TargetManager
 
 
@@ -84,7 +84,7 @@ def _fmt_dt(value: str) -> str:
 async def _deepseek_chat(system: str, user: str, max_tokens: int = None) -> str:
     """Call DeepSeek; never raise — return a graceful fallback on failure."""
     try:
-        kwargs = {
+        kwargs: dict[str, Any] = {
             "model": config.DEEPSEEK_MODEL,
             "messages": [
                 {"role": "system", "content": system},
@@ -350,7 +350,7 @@ async def casual_introduce(
         log(f"casual_introduce failed: {e}")
         intro = None
 
-    common = {}
+    common: dict[str, Any] = {}
     if isinstance(intro, dict):
         common = intro.get("common_chats") or {}
     n = len(common.get("chat_ids") or []) if isinstance(common, dict) else len(common)
@@ -458,7 +458,12 @@ async def handle_nlp(
                 handle = handles[0]
                 uid = await _resolve_handle(handle)
                 if deep_allowed and uid is not None:
-                    answer = await deep_whois(uid)
+                    if any(w in cleaned.lower() for w in ("everything", "dossier", "всё про", "все про")):
+                        import query as _query
+
+                        answer = _query.render_text(await _query.dossier(cleaned))
+                    else:
+                        answer = await deep_whois(uid)
                 else:
                     answer = await casual_whois(f"@{handle}", uid)
                     if uid is not None:
@@ -618,6 +623,7 @@ async def _reply_chunked(message, text: str) -> None:
 _PRIVATE_COMMANDS = [
     "start", "auth", "logout", "panel", "status", "dbstats",
     "scrape", "join", "targets", "whois", "introduce", "sweep",
+    "watch", "dossier",
 ]
 
 
@@ -948,6 +954,64 @@ def register_handlers(client: Client, admin_user_id: int) -> None:
             log(f"/sweep failed: {e}")
 
     # -- group mentions ----------------------------------------------------
+    @client.on_message(filters.command("watch") & filters.private)
+    async def _cmd_watch(client, message):  # noqa: ARG001
+        try:
+            uid = message.from_user.id
+            if uid != ADMIN_USER_ID:
+                return
+            if _locked(uid):
+                await message.reply_text("🔒 Locked: authenticate with /auth first.")
+                return
+            import watchlist as _watchlist
+
+            wl = _watchlist.get_watchlist()
+            parts = (message.text or "").split()
+            sub = parts[1].lower() if len(parts) > 1 else "list"
+            if sub == "add" and len(parts) > 2:
+                added = await wl.add(" ".join(parts[2:]))
+                await message.reply_text("✅ watching." if added else "ℹ️ already watched.")
+            elif sub == "remove" and len(parts) > 2:
+                removed = await wl.remove(" ".join(parts[2:]))
+                await message.reply_text("🗑 removed." if removed else "ℹ️ not in watchlist.")
+            else:
+                rows = wl.all()[:50]
+                if not rows:
+                    await message.reply_text("Watchlist empty. Usage: /watch add <token>")
+                else:
+                    lines = ["**👁 Watchlist**"]
+                    for item in rows:
+                        line = f"• {item.get('token')}"
+                        if item.get("note"):
+                            line += f" — {item['note']}"
+                        lines.append(line)
+                    await _reply_chunked(message, "\n".join(lines))
+        except Exception as e:  # noqa: BLE001
+            log(f"/watch failed: {e}")
+
+    @client.on_message(filters.command("dossier") & filters.private)
+    async def _cmd_dossier(client, message):  # noqa: ARG001
+        try:
+            uid = message.from_user.id
+            if uid != ADMIN_USER_ID:
+                return
+            if _locked(uid):
+                await message.reply_text("🔒 Locked: authenticate with /auth first.")
+                return
+            parts = (message.text or "").split(maxsplit=1)
+            if len(parts) < 2 or not parts[1].strip():
+                await message.reply_text(
+                    "Usage: /dossier <entity> — phone | @user | id | email | wallet | t.me link | text"
+                )
+                return
+            import query as _query
+
+            await message.reply_text("🕵️ building dossier…")
+            result = await _query.dossier(parts[1].strip())
+            await _reply_chunked(message, _query.render_text(result))
+        except Exception as e:  # noqa: BLE001
+            log(f"/dossier failed: {e}")
+
     @client.on_message(filters.mentioned & filters.group)
     async def _group_mention(client, message):
         try:
