@@ -2,6 +2,10 @@
 .env
 *.env
 .env.*
+!.env.example
+
+# Runtime state (cursors, filter cache, targets)
+state/
 
 # Telegram Userbot Session Files (CRITICAL: NEVER COMMIT THESE)
 *.session

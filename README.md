@@ -1,160 +1,139 @@
-# Telegram Continuous Indexer & DeepSeek RAG Engine
+# telegram-rag-bot v2 — Parallel OSINT & RAG Intelligence Engine
 
-A decoupled, low-cost Telegram chat indexing and semantic search system. The engine listens to incoming Telegram messages in real time via a Pyrogram Userbot, generates local vector embeddings using FastEmbed, stores them in Qdrant Cloud, and exposes a natural language RAG interface via a Telegram Inline Bot powered by DeepSeek AI.
-
-It also supports **multi-modal ingestion**: images are OCR'd and PDF/DOCX/TXT documents are text-extracted, so their contents become semantically searchable alongside regular messages.
-
----
-
-## 🤖 How to Interact with the Bot
-
-### 1. Direct Messages (Private Chat with Bot)
-
-* **Initial Setup / Activation (`/start`):**
-  Open a private chat with the bot ([@biginformation_bot](https://t.me/biginformation_bot)) and click or send **/start**.
-* **System Notifications & Storage Alerts:**
-  Telegram restricts bots from initiating contact with users (`PeerIdInvalid` error). Sending `/start` registers your user ID as an authorized peer. The bot uses this direct message channel to send:
-  * **Engine Bootup Status:** Confirmation when `start.sh` or `start.py` comes online.
-  * **Capacity Warning Alerts:** Automatic threshold notifications when your Qdrant collection approaches capacity limits (e.g., 800,000+ vectors).
+A dual-engine Telegram intelligence system backed by the **tg_bot_rag** Qdrant
+cluster database. A Pyrogram **userbot** continuously ingests chats in parallel;
+a global **bot** answers anywhere via natural language; deep OSINT profiles are
+gated behind an admin **challenge/response** handshake.
 
 ---
 
-### 2. In All Other Chats (Groups, Channels & Private Messages)
+## Architecture
 
-The bot operates globally using **Telegram Inline Mode**, meaning you can query your vectorized history from **any chat, group, or channel** without needing to add the bot to that group.
+```
+              ┌─────────────────────────┐        ┌──────────────────────────┐
+              │  Userbot (Pyrogram)     │        │  Global Bot (Pyrogram)   │
+              │  session: my_userbot    │        │  session: inline_bot     │
+              └────────────┬────────────┘        └────────────┬─────────────┘
+     parallel workers      │                                  │  @mentions / inline / private
+     (SCRAPER_WORKERS)     ▼                                  ▼
+   ┌───────────────────────────────┐              ┌──────────────────────────────┐
+   │ scraper.py                    │              │ bot.py                       │
+   │ • FloodGate (global pause)    │              │ • casual answers (public)    │
+   │ • RateGate (token bucket)     │              │ • /auth challenge → admin    │
+   │ • cursors + filter cache      │              │ • /panel, /status, /dbstats  │
+   │ • multi-modal OCR/PDF/DOCX    │              │ • /whois, /introduce (deep)  │
+   └──────────────┬────────────────┘              └──────────────┬───────────────┘
+                  ▼                                              ▼
+   ┌───────────────────────────────────────────────────────────────────────────┐
+   │ database.py  →  Qdrant Cloud (tg_bot_rag)                                 │
+   │   telegram_messages · telegram_chats · telegram_profiles · telegram_relations │
+   └──────────────────────────────▲────────────────────────────────────────────┘
+                                  │ profiles.py sweep (bios, photo hashes,
+                                  │  common groups, co-member/reply/mention edges)
+   ┌──────────────────────────────┴───────────┐   ┌────────────────────────────┐
+   │ main.py — orchestrator                   │   │ api.py — FastAPI           │
+   │ userbot+bot+scraper+profiles+shield      │   │ /health /status /metrics   │
+   └──────────────────────────────────────────┘   │ /control/* (Bearer token)  │
+                                                  └────────────────────────────┘
+```
 
-#### Step-by-Step Usage:
+Key design points:
 
-1. Open **any chat window** in Telegram.
-2. In the message input field, type your bot's handle followed by your query:
-   ```text
-   @biginformation_bot what did we discuss about server setup?
+- **Non-blocking parallel ingestion.** `asyncio` worker pool over a chat queue;
+  every Telegram call passes a global `RateGate` (token bucket) and a shared
+  `FloodGate`: when *any* worker hits `FloodWait`, all workers park until the
+  flood window clears (with margin + jitter), then resume — no thundering herd.
+- **Resumable scraping.** Per-chat pagination cursors persist to `state/`, so
+  restarts resume instead of re-walking history. A cluster-side dedup guard
+  (`filter_existing_message_ids`) prevents re-embedding already-indexed messages.
+- **Truthful profiles.** The profile sweep aggregates real indexed messages
+  (counts, active groups, reply/mention interactions) and enriches them with live
+  Telegram data (bio, 256-bit-projected profile-photo hash + metadata). Relations
+  are materialized as `co_member`, `replies`, `mentions` edges with weights.
+- **Gated OSINT.** Public surfaces (groups, inline) only ever return casual
+  summaries. Deep dossiers require the private admin handshake:
+  1. Admin sends `/auth` in the bot's private chat → nonce challenge.
+  2. On the server: `python rbac.py respond <nonce>` → response code.
+  3. Admin sends the code → authenticated session (sliding TTL, lockout on
+     failed attempts, single-use nonce). Only then do `/whois`, `/introduce`,
+     `/panel`, `/scrape` … unlock.
+- **StorageShield.** Hourly capacity check on `telegram_messages`; warns at 80%,
+  pauses all ingestion at 95%, DMs the admin.
 
-   Wait 1–2 seconds for the interactive inline results popup to appear above the keyboard.
+## Modules
 
-Inline Result Types:
-🤖 DeepSeek AI Summary (Top Result):
-Synthesizes top semantic matches across all indexed history into a single, concise AI response using DeepSeek API. Selecting this option posts the full AI answer into the chat.
+| File | Role |
+|---|---|
+| `config.py` | Single source of truth for all env-driven settings + `validate_config()` |
+| `database.py` | Lazy Qdrant/FastEmbed clients, payload builders, batched upserts, retrying reads |
+| `scraper.py` | FloodGate, RateGate, worker pool, cursors, chat filter cache, target joins, live listener |
+| `profiles.py` | Profile aggregation + Telegram enrichment + relation graph + `whois()`/`introduce()` |
+| `rbac.py` | HMAC challenge/response admin auth (+ CLI helper) |
+| `bot.py` | Global interaction bot: NLP routing, casual/deep answers, admin panel, inline mode |
+| `api.py` | FastAPI: `/health` (public), `/status`, `/metrics`, `/control/*` (Bearer token) |
+| `main.py` | Orchestrator: clients, tasks, signals, graceful shutdown |
+| `setup_db.py` | Creates the four collections + payload indexes (idempotent) |
+| `specs/` | Build-time specifications used to generate the modules |
 
-💬 Individual Matched Messages (Below AI Summary):
-Displays individual raw chat messages matching your query, complete with sender name, source chat title, date timestamp, and a clickable Jump to message Telegram link (t.me/c/...).
+## Quick start
 
-🧠 Multi-Modal Ingestion (OCR & Documents)
-
-Beyond plain text and captions, the engine extracts searchable text from media attachments:
-
-* **Images (OCR):** Photos are downloaded and passed through Tesseract OCR (`pytesseract` + `Pillow`). Extracted text is indexed with `source_type="photo_ocr"`. OCR languages are configurable via the `OCR_LANGUAGES` env var (default `eng+rus`).
-* **PDF Documents:** Text is extracted with `pypdf` and indexed with `source_type="document_pdf"`.
-* **DOCX Documents:** Text is extracted with `python-docx` and indexed with `source_type="document_docx"`.
-* **Plain Text Files:** `.txt` attachments are read directly and indexed with `source_type="document_txt"`.
-
-Extraction rules:
-
-* Only files with extensions in `SUPPORTED_DOC_EXTENSIONS` (`.pdf`, `.docx`, `.txt`) are processed.
-* Documents larger than `MAX_DOCUMENT_BYTES` (20 MB) are skipped.
-* Extracted text shorter than `MIN_EXTRACTED_TEXT_LENGTH` (10 chars) is discarded.
-* Each optional dependency is loaded defensively — if `pytesseract`, `pypdf`, or `python-docx` is missing, that modality is disabled with a warning and the engine keeps running.
-
-The `source_type` field is stored in each message payload and surfaced in inline results, so you can tell whether a match came from a message, an OCR'd image, or a document.
-
-🛡️ StorageShield (Capacity Guard)
-
-`start.py` runs a background `StorageShield` task that periodically checks the size of the `telegram_messages` collection against `MAX_VECTORS` (default `100,000`, configurable via env):
-
-* **≥ 80% capacity (`STORAGE_WARN_RATIO`):** sends a one-time warning DM to the admin via the inline bot.
-* **≥ 95% capacity (`STORAGE_PAUSE_RATIO`):** sets `scraping_paused = True`, which halts the background catch-up and deep scrapers to protect the cluster, and sends a critical DM.
-* **Below 80%:** resets the alert flag and resumes scraping automatically.
-
-The check interval is controlled by `STORAGE_CHECK_INTERVAL_SECONDS` (default 3600s). Alerts require the admin to have clicked `/start` on the bot first (otherwise Telegram returns `PeerIdInvalid`).
-
-🏗️ Architecture & Tech Stack
-   [ Telegram Chats / Groups ]
-                │
-                ▼ (Pyrogram Userbot Listener)
-         [ listener.py / start.py ]
-                │
-                ├──► FastEmbed (all-MiniLM-L6-v2) ──► Qdrant Cloud (Vectors)
-                │                                         ▲
-                ▼                                         │
-    [ Telegram Inline Bot (@biginformation_bot) ] ────────┘
-                │
-                ▼
-      [ DeepSeek RAG API ]
-Language & Runtime: Python 3.11 (macOS / Linux)
-
-Telegram Client: Pyrogram (Dual-client: Userbot + Bot API)
-
-Embedding Model: fastembed (sentence-transformers/all-MiniLM-L6-v2, 384 dimensions)
-
-Vector Database: Qdrant Cloud (telegram_messages and telegram_chats collections)
-
-LLM Synthesis: DeepSeek API (deepseek-chat)
-
-📁 Repository Structure
-
-.
-├── core.py           # Shared clients (Qdrant, DeepSeek, FastEmbed) and helpers
-├── setup_db.py       # Initializes Qdrant collections and payload indexes
-├── scraper.py        # CLI wrapper: runs the historical catch-up scraper
-├── listener.py       # CLI wrapper: runs the real-time Pyrogram message listener
-├── bot.py            # CLI wrapper: runs the Telegram Inline Bot interface
-├── start.py          # Unified continuous engine (Listener + Bot + Scraper + Monitor)
-├── start.sh          # Executable shell runner with virtualenv check
-├── requirements.txt  # Python package dependencies
-└── .env              # Secrets and API credentials (git-ignored)
-
-⚙️ Environment Configuration (.env)
-Create a .env file in the root directory with the following configuration:
-
-# Telegram API Credentials (from my.telegram.org)
-TELEGRAM_API_ID=12345678
-TELEGRAM_API_HASH=your_telegram_api_hash
-
-# Bot Credentials (from @BotFather)
-BOT_TOKEN=1234567890:AAA-BBB-CCC
-BOT_USERNAME=@biginformation_bot
-
-# Qdrant Cloud Settings
-QDRANT_URL=[https://your-cluster.qdrant.tech](https://your-cluster.qdrant.tech)
-QDRANT_API_KEY=your_qdrant_api_key
-
-# DeepSeek API Settings
-DEEPSEEK_API_KEY=your_deepseek_api_key
-
-🚀 Quick Start & Installation
-1. Environment Setup
-
-# Clone repository and enter directory
-git clone [https://github.com/your-username/telegram-rag-bot.git](https://github.com/your-username/telegram-rag-bot.git)
-cd telegram-rag-bot
-
-# Create and activate Python 3.11 virtual environment
-python3.11 -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
+```bash
+# 1. Environment
+python3.11 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-2. Initialize Qdrant Collections
-Run the setup script to generate telegram_messages and telegram_chats collections:
+# 2. Configure
+cp .env.example .env   # fill in Telegram, Qdrant, DeepSeek, ADMIN_SECRET, API_TOKEN
 
+# 3. Provision the cluster (safe to re-run)
 python setup_db.py
 
-3. Run Historical Scraper (Optional Initial Catch-up)
-Populate Qdrant with your existing message history:
+# 4. First run authorizes the userbot session (code from Telegram)
+python main.py
+```
 
-Bash
-python scraper.py
-4. Launch Unified Continuous Engine
-Make the startup script executable and run the unified server process:
+Run in background: `nohup ./start.sh > bot.log 2>&1 &`
 
-Bash
-chmod +x start.sh
-./start.sh
-To run continuously in the background on local macOS or AWS EC2:
+## Interacting
 
-Bash
-nohup ./start.sh > bot.log 2>&1 &
-📊 Storage Monitoring & Safety
+**Anyone, anywhere:**
+- Inline: `@<bot_username> what did we discuss about X?`
+- In a group where the bot is present: `@<bot_username> who is @someone?` → casual summary only.
+- Deep asks always answer with the casual view + a "🔒 authenticate" hint.
 
-`start.py` continuously monitors your vector collection point count against `MAX_VECTORS` (default `100,000`, configurable via the `MAX_VECTORS` env var). See the **StorageShield** section above for the full warning/pause behavior. If your Qdrant Cloud storage limit approaches maximum capacity, the engine sends an automated administrative notification directly to your Telegram DM and pauses background ingestion at the critical threshold.
+**Admin (private chat):**
+`/auth` → challenge; verify; then:
+`/panel` (buttons: status, DB metrics, pause/resume, targets, refresh) ·
+`/status` · `/dbstats` · `/scrape start|pause|resume` ·
+`/join <@group|t.me/link|id>` (queues a join target for the userbot) ·
+`/targets` · `/whois <@user|id>` · `/introduce <a> <b>` · `/sweep` (on-demand profile rebuild) · `/logout`
+
+## Control API
+
+`GET /health` — public liveness.
+`GET /status`, `GET /metrics`, `POST /control/scraper` `{"action":"pause|resume"}`,
+`POST /control/join` `{"peer":"@group"}`, `POST /control/sweep` — require
+`Authorization: Bearer $API_TOKEN`. Binds to `127.0.0.1` by default.
+
+## Tests
+
+Plain-python test scripts (no pytest needed), run from the repo root:
+
+```bash
+python tests/test_database.py     # payload builders + live embed + dedup guard
+python tests/test_scraper.py      # gates, cursors, filter cache, pagination (mocked)
+python tests/test_profiles.py     # aggregation, relations, sweep (mocked)
+python tests/test_rbac.py         # challenge/response, lockout, CLI helper
+python tests/test_bot.py          # NLP gating, auth flow, panel callbacks (mocked)
+python tests/test_api.py          # TestClient: auth, control endpoints
+python tests/test_main.py         # storage shield lifecycle (mocked)
+python tests/test_live_aggregate.py  # read-only sweep over the live cluster
+```
+
+## Joining Cyprus networking groups
+
+The account joins groups only from the managed target list — add them as admin
+with `/join <peer>` (or the control API). The userbot converges the list on the
+next scraper pass (extra flood-sensitive, hence capped concurrency), then the
+groups flow into the normal ingest pipeline. This keeps joins deliberate, safe,
+and auditable rather than blind mass-joining.

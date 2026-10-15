@@ -7,7 +7,11 @@ tgcrypto
 openai
 tenacity
 
-# Multi-modal extraction (optional but used by start.py)
+# Web / control API (api.py)
+fastapi
+uvicorn
+
+# Multi-modal extraction (optional but used by scraper.py)
 pytesseract
 pillow
 pypdf

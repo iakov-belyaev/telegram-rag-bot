@@ -1,22 +1,19 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# telegram-rag-bot launcher: venv check, deps, then the unified engine.
+set -euo pipefail
 
-# Navigate to project directory
 cd "$(dirname "$0")"
 
-# 1. Check if virtual environment exists and activate it
-if [ -d ".venv" ]; then
-    source .venv/bin/activate
-else
-    echo "❌ Error: Virtual environment .venv not found!"
+if [ ! -d ".venv" ]; then
+    echo "❌ Error: Virtual environment .venv not found! Create it with: python3.11 -m venv .venv"
     exit 1
 fi
+source .venv/bin/activate
 
-# 2. Check if .env file exists
 if [ ! -f ".env" ]; then
-    echo "❌ Error: .env file missing!"
+    echo "❌ Error: .env file missing! Copy .env.example and fill it in."
     exit 1
 fi
 
-# 3. Launch the unified engine
-echo "🚀 Starting Telegram Engine..."
-python start.py
+echo "🚀 Starting telegram-rag-bot v2 (main.py)..."
+exec python main.py
