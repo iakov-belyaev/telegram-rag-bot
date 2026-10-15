@@ -1,7 +1,7 @@
 """Verification of main.py — storage shield transitions, sweep fn, import-safety."""
 import asyncio
-import sys
 import pathlib as _pathlib
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,8 +14,8 @@ TMP = Path(tempfile.mkdtemp(prefix="main_test_"))
 config.STATE_DIR = TMP
 
 import database as db_mod
-import scraper
 import main as main_mod
+import scraper
 
 FAIL = []
 

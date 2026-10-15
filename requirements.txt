@@ -10,6 +10,11 @@ tenacity
 # Web / control API (api.py)
 fastapi
 uvicorn
+pydantic
+
+# Discovery web adapters + seeds config
+httpx
+pyyaml
 
 # Multi-modal extraction (optional but used by scraper.py)
 pytesseract

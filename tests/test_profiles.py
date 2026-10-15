@@ -1,15 +1,16 @@
 """Mock-driven verification of profiles.py (no network, canned scroll pages)."""
 import asyncio
-import sys
 import pathlib as _pathlib
+import sys
 from types import SimpleNamespace
 
 sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 
+from datetime import datetime, timezone
+
 import config
 import database as db_mod
 import profiles
-from datetime import datetime, timezone
 
 FAIL = []
 

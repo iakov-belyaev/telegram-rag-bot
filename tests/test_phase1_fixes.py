@@ -9,10 +9,11 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 
+from pyrogram import errors as tg_errors
+
 import config
 import metrics
 import profiles
-from pyrogram import errors as tg_errors
 
 FAIL = []
 
@@ -92,7 +93,7 @@ async def main():
     before_ctx = metrics.get_counter("peers_resolved_via_context")
     c = await profiles.resolve_user(ContextClient(), gate(), 77, context_chat_id=-100)
     check("resolve_user via context", c is not None and c.username == "ctx",
-          extra=f"scanned-hit for 77")
+          extra="scanned-hit for 77")
     check("context metric bumped", metrics.get_counter("peers_resolved_via_context") == before_ctx + 1)
 
     # warmup path
@@ -151,8 +152,9 @@ async def main():
     check("force_refresh bypasses cache", info_forced["refreshed"] is True and info_forced["bio"] == "bio")
 
     # ---------- api /prometheus route ----------
-    import api
     from fastapi.testclient import TestClient
+
+    import api
 
     client = TestClient(api.create_app())
     r = client.get("/prometheus", headers={"Authorization": f"Bearer {config.API_TOKEN}"})

@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Ruff (lint)
+        run: ruff check .
+
+      - name: Mypy (types, lenient)
+        run: mypy --config-file pyproject.toml api.py bot.py config.py database.py discovery.py export.py logging_config.py main.py metrics.py profiles.py quality.py query.py rbac.py scheduler.py scraper.py storage.py watchlist.py control_cli.py
+
+      - name: Tests
+        env:
+          # Tests use mocks / read-only paths; dummy creds keep imports happy
+          TELEGRAM_API_ID: "1"
+          TELEGRAM_API_HASH: "dummy"
+          BOT_TOKEN: "1:dummy"
+          QDRANT_URL: ""
+          QDRANT_API_KEY: ""
+          DEEPSEEK_API_KEY: "dummy"
+          ADMIN_SECRET: "dummy-secret"
+          API_TOKEN: "dummy-token"
+        run: python tests/run_all.py

@@ -1,19 +1,19 @@
 """Mock-driven verification of bot.py — intelligence + auth flow + admin panel + inline."""
 import asyncio
-import sys
 import pathlib as _pathlib
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))
 
+import bot
 import config
 import database as db_mod
 import profiles as profiles_mod
-import scraper
-import bot
 import rbac
+import scraper
 
 FAIL = []
 

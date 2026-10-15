@@ -20,10 +20,11 @@ config.DISCOVERY_AUTO_JOIN = True
 config.DISCOVERY_MUTE_JOINED = True
 config.DISCOVERY_AUTO_LEAVE_BAD = False
 
+from pyrogram import errors as tg_errors
+
 import discovery
 import metrics
 import scraper
-from pyrogram import errors as tg_errors
 
 FAIL = []
 

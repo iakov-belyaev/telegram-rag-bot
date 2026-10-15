@@ -1,0 +1,22 @@
+services:
+  bot:
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # Bind the control API to the host's localhost only.
+    ports:
+      - "127.0.0.1:8088:8088"
+    volumes:
+      - ./state:/app/state          # cursors, quality cache, discovery queue, failover SQLite
+      - ./logs:/app/logs            # structured logs
+      - ./seeds.yaml:/app/seeds.yaml:ro
+      # Session files: COPY them into the container once (interactive login
+      # cannot run headless). Example after `docker compose up -d --no-start`:
+      #   docker compose cp my_userbot.session bot:/app/
+      #   docker compose cp inline_bot.session bot:/app/
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8088/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s

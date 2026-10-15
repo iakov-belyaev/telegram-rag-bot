@@ -5,6 +5,81 @@ Format: phase → change → rationale → verification. Newest entries on top.
 
 ---
 
+## Phase 2 — Autonomous OSINT platform
+
+**Verification summary:** full suite green — `python tests/run_all.py` → 18/18 suites
+pass (incl. storage failover, query, wiring, live read-only aggregation). `ruff` and
+`mypy` run clean over all 18 source files. Qdrant `tg_bot_rag` untouched by tests
+(read-only paths only).
+
+### 2.1 Quality gate + autonomous discovery + structured logging (commit f2780ff)
+
+- `quality.py` (GOOD/SPAM/SCAM/JUNK heuristics; pluggable LLM hook off by default),
+  `discovery.py` (persistent queue; seeds.yaml, Cyprus-IT link extraction,
+  `@kiprinfobot` menu adapter, optional web adapters), `logging_config.py`
+  (JSON + rotating file). Joined groups are always muted first; only GOOD groups join.
+- Bug found during testing: `discovery.py` referenced a nonexistent
+  `config.QDRANT_COLLECTION_MESSAGES` (silently swallowed) → fixed to
+  `config.MESSAGES_COLLECTION`.
+
+### 2.2 Storage failover layer (`storage.py`)
+
+- All callers (`scraper`, `profiles`, `bot`, `api`, `discovery`, `main`) switched from
+  `database` to `storage`: Qdrant primary, SQLite mirror (`state/failover_store.db`),
+  degrade after `FAILOVER_DEGRADE_ERRORS` consecutive failures, dirty-row tracking,
+  automatic probe + resync on recovery (fresh embeddings, batched).
+- Decisions (documented): rows are marked dirty on sqlite writes and cleared only
+  after successful re-upload; `_use_qdrant()` resets the error counter (otherwise
+  the first post-recovery hiccup instantly re-degrades); reads served from SQLite
+  while degraded are payload+FTS only (no vector search in degraded mode).
+- Bugs found by the failover test suite and fixed: `fetch_dirty` read `rowid`
+  without selecting it (`IndexError` on every resync) → `SELECT rowid AS rowid, *`;
+  `_use_qdrant` stale-counter re-degrade (above).
+
+### 2.3 Natural-language query interface (`query.py`) + exports
+
+- Entity detection: phone / @username / user_id / email / wallet (ETH+BTC) / t.me
+  link / free text; fan-out over messages, profiles, relations, chats, participants;
+  structured dossier with timeline + stats; text renderer; `--json` CLI.
+- Decision: bare digit-runs (no `+`/separators) classify as `user_id`, not `phone`
+  (Telegram ids are 5-15 digits) — phones require a `+` or separator formatting, and
+  bio matching is digit-normalized (`+357 99 123456` matches `+35799123456`).
+- `export.py`: dossier → JSON / JSONL / CSV / HTML (escaped).
+- Surfaces: CLI, `POST /query`, bot `/dossier` + natural phrase "everything on X".
+
+### 2.4 Support modules
+
+- `watchlist.py` (tokens scanned against every ingested batch; hits queued to
+  `state/watchlist_hits.jsonl`), `scheduler.py` (interval jobs), `control_cli.py`
+  (pause/resume/stop/status flag CLI + watcher), exports. Watchlist scan hooked into
+  `scraper.index_messages_batch` (alert-only; never blocks ingestion).
+- Decision: purely-numeric watchlist tokens need >= 6 digits and match against the
+  digit-normalized text; letter-bearing tokens use case-insensitive substring —
+  short numeric tokens no longer fire on every message.
+
+### 2.5 Orchestrator wiring (`main.py`)
+
+- Boot: structured logging → clients → storage start → scraper, profiles, API,
+  StorageShield, discovery (if enabled), scheduler (watchlist flush),
+  flags-watchdog → notify. Shutdown: stop flag → cancel tasks → storage flush →
+  notify. Userbot `AUTH_KEY_UNREGISTERED` gets a targeted message with the exact
+  re-login command (exit code 2).
+- `config.py`: `WATCHLIST_FLUSH_SECONDS`; discovery/failover/log/watchlist blocks.
+
+### 2.6 Hardening
+
+- `ruff` clean (E/F/W/B/I), `mypy` clean (18 modules, lenient-but-real config).
+  Fixed: 7x B904 (exception chaining in api.py), B023 (scraper consumer closure
+  now binds its cycle's queue explicitly), embedding-pair `zip()` → `strict=True`
+  (misaligned vectors now fail loudly instead of silently truncating), path
+  annotations, openai-stub ignores.
+- `Dockerfile` + `docker-compose.yml` (healthchecks, volumes, localhost-only API),
+  `.github/workflows/ci.yml` (ruff + mypy + tests), `pyproject.toml`,
+  `requirements-dev.txt`, `seeds.yaml.example`; deps fixed (`httpx`, `pyyaml`,
+  `pydantic` were used but undeclared).
+
+---
+
 ## Phase 1 — Critical fixes (profile scraping)
 
 **Verification summary:** `tests/test_phase1_fixes.py` — 20/20 checks pass; related

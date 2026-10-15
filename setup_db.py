@@ -5,9 +5,10 @@ telegram_messages, telegram_chats, telegram_profiles, telegram_relations.
 Idempotent: safe to re-run; never deletes existing data.
 """
 
-import config
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, PayloadSchemaType, VectorParams
+
+import config
 
 
 def build_client() -> QdrantClient:

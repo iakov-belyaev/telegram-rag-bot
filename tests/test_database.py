@@ -1,7 +1,7 @@
 """Functional verification of database.py — pure builders + live embed + live read-only Qdrant."""
 import asyncio
-import sys
 import pathlib as _pathlib
+import sys
 import uuid
 from types import SimpleNamespace
 

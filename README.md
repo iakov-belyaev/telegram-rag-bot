@@ -1,9 +1,11 @@
-# telegram-rag-bot v2 — Parallel OSINT & RAG Intelligence Engine
+# telegram-rag-bot v2 — Autonomous Cyprus OSINT & RAG Intelligence Engine
 
 A dual-engine Telegram intelligence system backed by the **tg_bot_rag** Qdrant
 cluster database. A Pyrogram **userbot** continuously ingests chats in parallel;
-a global **bot** answers anywhere via natural language; deep OSINT profiles are
-gated behind an admin **challenge/response** handshake.
+a global **bot** answers anywhere via natural language; deep OSINT dossiers are
+gated behind an admin **challenge/response** handshake. Ingestion survives Qdrant
+outages via a transparent local failover store, and the system expands its own
+coverage through an autonomous, quality-gated discovery agent.
 
 ---
 
@@ -20,21 +22,32 @@ gated behind an admin **challenge/response** handshake.
    │ scraper.py                    │              │ bot.py                       │
    │ • FloodGate (global pause)    │              │ • casual answers (public)    │
    │ • RateGate (token bucket)     │              │ • /auth challenge → admin    │
-   │ • cursors + filter cache      │              │ • /panel, /status, /dbstats  │
-   │ • multi-modal OCR/PDF/DOCX    │              │ • /whois, /introduce (deep)  │
+   │ • cursors + filter cache      │              │ • /panel /status /dbstats    │
+   │ • multi-modal OCR/PDF/DOCX    │              │ • /whois /introduce /dossier │
+   │ • watchlist scan per batch    │              │ • /watch + "everything on X" │
    └──────────────┬────────────────┘              └──────────────┬───────────────┘
                   ▼                                              ▼
    ┌───────────────────────────────────────────────────────────────────────────┐
-   │ database.py  →  Qdrant Cloud (tg_bot_rag)                                 │
-   │   telegram_messages · telegram_chats · telegram_profiles · telegram_relations │
+   │ storage.py — failover-aware storage layer                                 │
+   │   Qdrant Cloud (tg_bot_rag): telegram_messages · telegram_chats ·         │
+   │     telegram_profiles · telegram_relations                                │
+   │   ↕ degrade on errors / recover + resync                                  │
+   │   SQLite mirror (state/failover_store.db): same schema + dirty-tracking   │
    └──────────────────────────────▲────────────────────────────────────────────┘
                                   │ profiles.py sweep (bios, photo hashes,
                                   │  common groups, co-member/reply/mention edges)
    ┌──────────────────────────────┴───────────┐   ┌────────────────────────────┐
    │ main.py — orchestrator                   │   │ api.py — FastAPI           │
-   │ userbot+bot+scraper+profiles+shield      │   │ /health /status /metrics   │
+   │ scraper · profiles · storage-shield ·    │   │ /health /status /metrics   │
+   │ discovery · scheduler · flags-watchdog   │   │ /query /prometheus         │
    └──────────────────────────────────────────┘   │ /control/* (Bearer token)  │
-                                                  └────────────────────────────┘
+   ┌──────────────────────────────────────────┐   └────────────────────────────┘
+   │ discovery.py — autonomous expansion      │
+   │ seeds.yaml · Cyprus-IT scan · @kiprinfobot│
+   │ web adapter (off by default) → queue      │
+   │ quality.py gate: GOOD/SPAM/SCAM/JUNK      │
+   │ auto-join (muted) only GOOD groups        │
+   └──────────────────────────────────────────┘
 ```
 
 Key design points:
@@ -42,37 +55,61 @@ Key design points:
 - **Non-blocking parallel ingestion.** `asyncio` worker pool over a chat queue;
   every Telegram call passes a global `RateGate` (token bucket) and a shared
   `FloodGate`: when *any* worker hits `FloodWait`, all workers park until the
-  flood window clears (with margin + jitter), then resume — no thundering herd.
-- **Resumable scraping.** Per-chat pagination cursors persist to `state/`, so
-  restarts resume instead of re-walking history. A cluster-side dedup guard
-  (`filter_existing_message_ids`) prevents re-embedding already-indexed messages.
-- **Truthful profiles.** The profile sweep aggregates real indexed messages
-  (counts, active groups, reply/mention interactions) and enriches them with live
-  Telegram data (bio, 256-bit-projected profile-photo hash + metadata). Relations
-  are materialized as `co_member`, `replies`, `mentions` edges with weights.
-- **Gated OSINT.** Public surfaces (groups, inline) only ever return casual
-  summaries. Deep dossiers require the private admin handshake:
-  1. Admin sends `/auth` in the bot's private chat → nonce challenge.
-  2. On the server: `python rbac.py respond <nonce>` → response code.
-  3. Admin sends the code → authenticated session (sliding TTL, lockout on
-     failed attempts, single-use nonce). Only then do `/whois`, `/introduce`,
-     `/panel`, `/scrape` … unlock.
-- **StorageShield.** Hourly capacity check on `telegram_messages`; warns at 80%,
-  pauses all ingestion at 95%, DMs the admin.
+  flood window clears (with margin + jitter), then resume.
+- **Resumable scraping.** Per-chat pagination cursors persist to `state/`;
+  a cluster-side dedup guard (`filter_existing_message_ids`) prevents re-embedding.
+- **Transparent storage failover.** `storage.py` mirrors every write into SQLite
+  while serving Qdrant. After `FAILOVER_DEGRADE_ERRORS` consecutive Qdrant errors
+  it degrades to the SQLite mirror (reads and writes keep working, dirty rows are
+  tracked); a health monitor probes Qdrant and, on recovery, resyncs the dirty
+  rows back with fresh embeddings — no data loss, no manual steps.
+- **Truthful profiles.** The profile sweep aggregates real indexed messages and
+  enriches them with live Telegram data (bio, sha256-projected photo hash +
+  metadata). Relations are materialized as `co_member`, `replies`, `mentions`
+  edges with weights.
+- **Gated OSINT.** Public surfaces only return casual summaries. Deep dossiers
+  require the private admin handshake: `/auth` → nonce challenge → on the server
+  `python rbac.py respond <nonce>` → reply with the code → sliding TTL session.
+- **Autonomous discovery, quality-gated.** Discovery adapters (seed file,
+  Cyprus-IT chat link extraction, `@kiprinfobot` menu walker, optional web
+  search) feed one persistent queue. Before any join, `quality.py` classifies
+  the group (spam/scam/junk heuristics + optional pluggable LLM hook); only
+  GOOD groups are joined — and every join is **muted immediately**.
+- **Natural-language dossier query.** `query.py` parses entities (phone, @username,
+  user_id, email, wallet, t.me link, free text), fans out across messages,
+  profiles, relations and chats, and returns a structured dossier — via CLI
+  (`python query.py "give me everything on +357..."`), HTTP (`POST /query`),
+  the bot (`/dossier`, or just ask `everything on X` in private chat).
+- **Watchlist + scheduler + kill switch.** Tracked tokens are scanned against
+  every ingested batch; hits queue up and the scheduler DMs them to the admin.
+  `python control_cli.py pause|resume|stop|status` writes a flag file that the
+  orchestrator's watchdog applies within seconds — a remote kill switch.
+- **StorageShield.** Capacity check on `telegram_messages`; warns at 80%,
+  pauses all ingestion at 95%, DMs the admin, auto-resumes on recovery.
 
 ## Modules
 
 | File | Role |
 |---|---|
-| `config.py` | Single source of truth for all env-driven settings + `validate_config()` |
-| `database.py` | Lazy Qdrant/FastEmbed clients, payload builders, batched upserts, retrying reads |
-| `scraper.py` | FloodGate, RateGate, worker pool, cursors, chat filter cache, target joins, live listener |
-| `profiles.py` | Profile aggregation + Telegram enrichment + relation graph + `whois()`/`introduce()` |
+| `config.py` | Single source of truth for env settings + `validate_config()` |
+| `database.py` | Qdrant-native layer: lazy clients, payload builders, batched upserts, retrying reads |
+| `storage.py` | Failover-aware layer used by all callers: Qdrant + SQLite mirror, degrade/recover/resync |
+| `scraper.py` | FloodGate, RateGate, worker pool, cursors, filter cache, target joins, live listener, watchlist scan |
+| `profiles.py` | Profile aggregation + enrichment + relation graph + `whois()`/`introduce()` |
+| `quality.py` | Group quality classifier: GOOD / SPAM / SCAM / JUNK |
+| `discovery.py` | Discovery queue + adapters (seeds, Cyprus-IT, @kiprinfobot, web) + join agent |
+| `query.py` | Entity parsing + dossier fan-out + rendering (CLI/HTTP/bot) |
+| `export.py` | Dossier exports: JSON, JSONL, CSV, HTML |
+| `watchlist.py` | Token watchlist + match + hits queue |
+| `scheduler.py` | Minimal interval scheduler for background jobs |
+| `control_cli.py` | `pause`/`resume`/`stop`/`status` CLI + flag watcher |
 | `rbac.py` | HMAC challenge/response admin auth (+ CLI helper) |
-| `bot.py` | Global interaction bot: NLP routing, casual/deep answers, admin panel, inline mode |
-| `api.py` | FastAPI: `/health` (public), `/status`, `/metrics`, `/control/*` (Bearer token) |
-| `main.py` | Orchestrator: clients, tasks, signals, graceful shutdown |
-| `setup_db.py` | Creates the four collections + payload indexes (idempotent) |
+| `bot.py` | Global bot: NLP routing, casual/deep answers, admin panel, watchlist, dossiers, inline |
+| `api.py` | FastAPI: `/health`, `/status`, `/metrics`, `/query`, `/prometheus`, `/control/*` |
+| `logging_config.py` | JSON structured logging (rotating file + console) |
+| `metrics.py` | Dependency-free counters/gauges + Prometheus exposition |
+| `main.py` | Orchestrator: clients, tasks, scheduler, watchdog, signals, graceful shutdown |
+| `setup_db.py` | Creates collections + payload indexes (idempotent) |
 | `specs/` | Build-time specifications used to generate the modules |
 
 ## Quick start
@@ -84,56 +121,74 @@ pip install -r requirements.txt
 
 # 2. Configure
 cp .env.example .env   # fill in Telegram, Qdrant, DeepSeek, ADMIN_SECRET, API_TOKEN
+cp seeds.yaml.example seeds.yaml   # optional: bootstrap groups
 
 # 3. Provision the cluster (safe to re-run)
 python setup_db.py
 
-# 4. First run authorizes the userbot session (code from Telegram)
+# 4. First run authorizes the userbot session (interactive: phone → code)
 python main.py
 ```
 
 Run in background: `nohup ./start.sh > bot.log 2>&1 &`
+Docker: `docker compose up -d` (copy session files into the container first —
+interactive login cannot run headless; see docker-compose.yml notes).
 
 ## Interacting
 
 **Anyone, anywhere:**
-- Inline: `@<bot_username> what did we discuss about X?`
-- In a group where the bot is present: `@<bot_username> who is @someone?` → casual summary only.
+- Inline or group mention: `@<bot_username> who is @someone?` → casual summary only.
 - Deep asks always answer with the casual view + a "🔒 authenticate" hint.
 
-**Admin (private chat):**
-`/auth` → challenge; verify; then:
-`/panel` (buttons: status, DB metrics, pause/resume, targets, refresh) ·
-`/status` · `/dbstats` · `/scrape start|pause|resume` ·
-`/join <@group|t.me/link|id>` (queues a join target for the userbot) ·
-`/targets` · `/whois <@user|id>` · `/introduce <a> <b>` · `/sweep` (on-demand profile rebuild) · `/logout`
+**Admin (private chat):** `/auth` → challenge → verify. Then:
+`/panel` · `/status` · `/dbstats` · `/scrape start|pause|resume` ·
+`/join <@group|t.me/link|id>` · `/targets` ·
+`/whois <@user|id>` · `/introduce <a> <b>` · `/sweep [full]` · `/logout` ·
+`/watch add|remove|list <token>` · `/dossier <entity>` — or ask naturally:
+`everything on @someone`.
+
+## Query / Export / Control CLIs
+
+```bash
+python query.py "give me everything on +357 99 123456"      # dossier (text)
+python query.py "@someone" --json --limit 100               # machine output
+python export.py "@someone" --format all --out state/exports # json/jsonl/csv/html
+python control_cli.py pause | resume | stop | status        # remote kill switch
+python rbac.py respond <nonce>                              # auth challenge response
+python tests/run_all.py                                     # full test suite
+```
 
 ## Control API
 
-`GET /health` — public liveness.
-`GET /status`, `GET /metrics`, `POST /control/scraper` `{"action":"pause|resume"}`,
-`POST /control/join` `{"peer":"@group"}`, `POST /control/sweep` — require
-`Authorization: Bearer $API_TOKEN`. Binds to `127.0.0.1` by default.
+`GET /health` — public liveness. Token-gated (Bearer):
+`GET /status` (includes storage failover state), `GET /metrics`, `GET /prometheus`,
+`POST /query {"query": "...", "limit": 50}`,
+`POST /control/scraper {"action":"pause|resume"}`,
+`POST /control/join {"peer":"@group"}`, `POST /control/sweep`.
+Binds to `127.0.0.1` by default.
 
-## Tests
+## Tests & CI
 
-Plain-python test scripts (no pytest needed), run from the repo root:
+All suites are plain-python scripts (no pytest needed) and are run in one shot:
 
 ```bash
-python tests/test_database.py     # payload builders + live embed + dedup guard
-python tests/test_scraper.py      # gates, cursors, filter cache, pagination (mocked)
-python tests/test_profiles.py     # aggregation, relations, sweep (mocked)
-python tests/test_rbac.py         # challenge/response, lockout, CLI helper
-python tests/test_bot.py          # NLP gating, auth flow, panel callbacks (mocked)
-python tests/test_api.py          # TestClient: auth, control endpoints
-python tests/test_main.py         # storage shield lifecycle (mocked)
-python tests/test_live_aggregate.py  # read-only sweep over the live cluster
+python tests/run_all.py
 ```
 
-## Joining Cyprus networking groups
+18 suites cover: payload builders + live embed, scraper gates/cursors/workers,
+profiles aggregation/relations, phase-1 fixes, RBAC, bot NLP/panel, API clients,
+orchestrator shield, quality classifier, discovery adapters, storage failover
+(degrade/recover/resync), query dossiers, watchlist, scheduler, control CLI,
+exports, main wiring, and a read-only live aggregation over the real cluster.
 
-The account joins groups only from the managed target list — add them as admin
-with `/join <peer>` (or the control API). The userbot converges the list on the
-next scraper pass (extra flood-sensitive, hence capped concurrency), then the
-groups flow into the normal ingest pipeline. This keeps joins deliberate, safe,
-and auditable rather than blind mass-joining.
+CI (`.github/workflows/ci.yml`): ruff + mypy + `tests/run_all.py` on push.
+
+## Production notes
+
+- Keep `.env` private; it is git-ignored. Session files (`*.session`) never commit.
+- `state/` holds cursors, queue, watchlist, control flags, failover SQLite,
+  exports — back it up, it is the resume state.
+- A degraded (SQLite) mode keeps serving reads; check `GET /status` →
+  `failover.mode`. Resync happens automatically after Qdrant recovers.
+- Auto-joined groups are muted before any other action; only quality-GOOD
+  groups are ever joined.

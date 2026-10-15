@@ -1,7 +1,7 @@
 """Mock-driven verification of scraper.py machinery (no Telegram network)."""
 import asyncio
-import sys
 import pathlib as _pathlib
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -18,9 +18,10 @@ config.SCRAPER_STATE_FILE = TMP / "scraper_state.json"
 config.CHAT_FILTER_CACHE_FILE = TMP / "chat_filter_cache.json"
 config.TARGET_GROUPS_FILE = TMP / "target_groups.json"
 
+from pyrogram import errors as tg_errors  # noqa: E402
+
 import database as db_mod  # noqa: E402
 import scraper  # noqa: E402
-from pyrogram import errors as tg_errors  # noqa: E402
 
 FAIL = []
 

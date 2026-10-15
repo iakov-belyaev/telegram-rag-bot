@@ -10,13 +10,13 @@ from typing import Any, Callable, Optional
 
 from fastembed import TextEmbedding
 from qdrant_client import QdrantClient
+from qdrant_client.http.exceptions import UnexpectedResponse
 from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
     PointStruct,
 )
-from qdrant_client.http.exceptions import UnexpectedResponse
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 import config
@@ -95,7 +95,9 @@ async def embed_texts(texts: list[str]) -> list[list[float]]:
     vectors: list[list[float]] = []
     for start in range(0, len(items), batch_size):
         chunk = items[start : start + batch_size]
-        chunk_vectors = await asyncio.to_thread(lambda c=chunk: list(model.embed(c)))
+        chunk_vectors = await asyncio.to_thread(
+            lambda c=chunk: list(model.embed(c))  # type: ignore[misc]
+        )
         vectors.extend(v.tolist() for v in chunk_vectors)
     return vectors
 
@@ -379,7 +381,8 @@ async def search_messages(
         must.append(
             FieldCondition(key="sender_username", match=MatchValue(value=sender_username))
         )
-    query_filter = Filter(must=must) if must else None
+    # qdrant stubs want a union-typed list; ours is always FieldCondition
+    query_filter = Filter(must=must) if must else None  # type: ignore[arg-type]
 
     response = await _qdrant_read(
         None,

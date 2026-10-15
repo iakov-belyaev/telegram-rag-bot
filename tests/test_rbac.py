@@ -1,7 +1,7 @@
 """Verification of rbac.py challenge/response auth (stdlib only, no network)."""
+import pathlib as _pathlib
 import subprocess
 import sys
-import pathlib as _pathlib
 import time
 
 sys.path.insert(0, str(_pathlib.Path(__file__).resolve().parent.parent))

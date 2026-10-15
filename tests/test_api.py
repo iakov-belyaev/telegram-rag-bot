@@ -1,6 +1,6 @@
 """Verification of api.py via FastAPI TestClient (mocked control, tmp state files)."""
-import sys
 import pathlib as _pathlib
+import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,9 +13,10 @@ TMP = Path(tempfile.mkdtemp(prefix="api_test_"))
 config.TARGET_GROUPS_FILE = TMP / "target_groups.json"
 config.STATE_DIR = TMP
 
+from fastapi.testclient import TestClient
+
 import api
 import scraper
-from fastapi.testclient import TestClient
 
 FAIL = []
 
@@ -45,6 +46,7 @@ r = client.get("/status", headers=AUTH)
 body = r.json() if r.status_code == 200 else {}
 check("/status with token 200 + keys", r.status_code == 200 and "scraper" in body and "config" in body)
 import json as _json
+
 _dump = _json.dumps(body)
 check("/status config has no secret values",
       config.ADMIN_SECRET not in _dump and config.API_TOKEN not in _dump

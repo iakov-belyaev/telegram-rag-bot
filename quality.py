@@ -17,7 +17,7 @@ from typing import Any, Optional
 import config
 import metrics
 from logging_config import get_logger
-from scraper import FloodGate, RateGate, iterate_with_flood, telegram_call
+from scraper import FloodGate, iterate_with_flood, telegram_call
 
 _logger = get_logger("quality")
 
