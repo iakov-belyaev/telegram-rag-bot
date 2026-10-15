@@ -1,0 +1,16 @@
+# Discovery seeds — copy to seeds.yaml (git-ignored) and edit.
+# Bootstrap peers the userbot should join/monitor, plus free-text queries handed
+# to the @kiprinfobot and web-search discovery adapters.
+
+peers:
+  # - "@cyprus_it"                # open username peer
+  # - "https://t.me/+AbCdEfGhIjK" # invite link
+  # - "-1001234567890"            # numeric chat id
+
+queries:
+  # - "кипр русскоязычные чаты"
+  # - "cyprus business networking"
+
+# Optional: extra directory pages for the web adapter (used only when
+# WEB_DISCOVERY_ENABLED=true and robots.txt allows fetching).
+directory_urls: []

@@ -21,6 +21,7 @@ from qdrant_client.models import PointStruct
 import config
 import database as db
 import metrics
+from logging_config import get_logger
 
 # --- Multi-modal extraction (optional dependencies) ---
 # Availability flags are set at import; warnings are logged lazily on first use.
@@ -44,9 +45,12 @@ except ImportError:
     DOCX_AVAILABLE = False
 
 
+_logger = get_logger("scraper")
+
+
 def log(message: str) -> None:
-    """Timestamped runtime log line (never called at import time)."""
-    print(f"[scraper {time.strftime('%H:%M:%S')}] {message}", flush=True)
+    """Runtime log line: console line + JSON file via structured logging."""
+    _logger.info("%s", message)
 
 
 # ==========================================
@@ -450,16 +454,23 @@ async def join_converge(client, gate: FloodGate, rate: RateGate, manager: Target
             await gate.wait()
             try:
                 await telegram_call(gate, client.join_chat, peer)
+                chat = None
                 title = ""
                 try:
                     chat = await telegram_call(gate, client.get_chat, peer)
                     title = getattr(chat, "title", "") or ""
                 except Exception:
                     pass
+                if config.DISCOVERY_MUTE_JOINED:
+                    await mute_chat(client, getattr(chat, "id", None) or peer)
                 await manager.set_state(peer, "joined", title=title)
+                metrics.inc("groups_joined")
                 result["joined"] += 1
             except tg_errors.UserAlreadyParticipant:
+                if config.DISCOVERY_MUTE_JOINED:
+                    await mute_chat(client, peer)
                 await manager.set_state(peer, "joined")
+                metrics.inc("groups_joined")
                 result["joined"] += 1
             except Exception as e:
                 await manager.set_state(peer, "error", note=str(e)[:200])
@@ -469,6 +480,47 @@ async def join_converge(client, gate: FloodGate, rate: RateGate, manager: Target
     return result
 
 
+async def mute_chat(client, chat_id) -> bool:
+    """Mute a chat forever (silent, no previews). Never raises; returns success.
+
+    Uses the raw API because Pyrogram has no high-level mute helper:
+    account.UpdateNotifySettings takes an InputNotifyPeer wrapper and an
+    InputPeerNotifySettings with mute_until as a 32-bit int (max = 2038 epoch).
+    """
+    try:
+        from pyrogram.raw import functions as raw_functions
+        from pyrogram.raw import types as raw_types
+
+        peer = await client.resolve_peer(chat_id)
+        await client.invoke(
+            raw_functions.account.UpdateNotifySettings(
+                peer=raw_types.InputNotifyPeer(peer=peer),
+                settings=raw_types.InputPeerNotifySettings(
+                    show_previews=False, silent=True, mute_until=2147483647
+                ),
+            )
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        log(f"⚠️ mute failed for {chat_id}: {e}")
+        metrics.inc("mute_failures")
+        return False
+
+
+_QUALITY_CACHE = None
+
+
+def _quality_cache_singleton():
+    """Lazy singleton for the discovery quality cache (import kept local)."""
+    global _QUALITY_CACHE
+    if _QUALITY_CACHE is None:
+        from quality import QualityCache
+
+        _QUALITY_CACHE = QualityCache()
+        _QUALITY_CACHE.load()
+    return _QUALITY_CACHE
+
+
 # ==========================================
 # 5. CHAT QUALITY FILTER (CACHED)
 # ==========================================
@@ -476,7 +528,28 @@ NOISE_TITLE_REGEX = re.compile("|".join(config.NOISE_TITLE_PATTERNS), re.IGNOREC
 
 
 async def is_high_value_chat(client, gate: FloodGate, cache: ChatFilterCache, chat) -> tuple[bool, str]:
-    """Decide whether a chat is worth scraping; (verdict, reason)."""
+    """Decide whether a chat is worth scraping; (verdict, reason).
+
+    Quality-classifier verdicts (from discovery triage) take precedence: GOOD is
+    indexed, SPAM/SCAM/JUNK are never indexed, UNKNOWN/missing falls through to
+    the legacy heuristic filter below.
+    """
+    # 0. Quality classifier verdict (lazy import avoids a module cycle)
+    try:
+        from quality import GOOD, QualityCache
+        import config as _config
+
+        qcache = _quality_cache_singleton()
+        verdict = qcache.get(chat.id)
+        if verdict is not None:
+            label = verdict.get("label")
+            if label == GOOD:
+                return True, "quality:GOOD"
+            if label:
+                return False, f"quality:{label}"
+    except Exception as e:  # noqa: BLE001
+        log(f"⚠️ quality cache consult failed: {e}")
+
     # 1. Cache hit
     cached = cache.get(chat.id)
     if cached is not None:

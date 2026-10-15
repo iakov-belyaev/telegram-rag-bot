@@ -39,6 +39,13 @@ def _env_float(key: str, default: float) -> float:
         return default
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.getenv(key)
+    if raw is None or raw.strip() == "":
+        return default
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
 # --- Telegram credentials & sessions ---
 
 TELEGRAM_API_ID: int = _env_int("TELEGRAM_API_ID", 0)
@@ -190,6 +197,77 @@ API_HOST: str = _env_str("API_HOST", "127.0.0.1")
 API_PORT: int = _env_int("API_PORT", 8088)
 API_TOKEN: str = _env_str("API_TOKEN", "")
 
+# --- Failover storage ---
+
+FAILOVER_ENABLED: bool = _env_bool("FAILOVER_ENABLED", True)
+FAILOVER_SQLITE_PATH: Path = STATE_DIR / "failover_store.db"
+FAILOVER_HEALTH_INTERVAL_SECONDS: int = _env_int("FAILOVER_HEALTH_INTERVAL_SECONDS", 30)
+FAILOVER_DEGRADE_ERRORS: int = _env_int("FAILOVER_DEGRADE_ERRORS", 3)
+FAILOVER_PROBE_TIMEOUT_SECONDS: int = _env_int("FAILOVER_PROBE_TIMEOUT_SECONDS", 8)
+FAILOVER_RESYNC_BATCH: int = _env_int("FAILOVER_RESYNC_BATCH", 200)
+
+# --- Structured logging ---
+
+LOG_LEVEL: str = _env_str("LOG_LEVEL", "INFO")
+LOG_JSON: bool = _env_bool("LOG_JSON", True)
+LOG_DIR: Path = Path(_env_str("LOG_DIR", "logs"))
+LOG_MAX_BYTES: int = _env_int("LOG_MAX_BYTES", 10 * 1024 * 1024)
+LOG_BACKUP_COUNT: int = _env_int("LOG_BACKUP_COUNT", 5)
+
+# --- Group discovery ---
+
+DISCOVERY_ENABLED: bool = _env_bool("DISCOVERY_ENABLED", True)
+DISCOVERY_INTERVAL_SECONDS: int = _env_int("DISCOVERY_INTERVAL_SECONDS", 1800)
+DISCOVERY_AUTO_JOIN: bool = _env_bool("DISCOVERY_AUTO_JOIN", True)
+DISCOVERY_MUTE_JOINED: bool = _env_bool("DISCOVERY_MUTE_JOINED", True)
+DISCOVERY_AUTO_LEAVE_BAD: bool = _env_bool("DISCOVERY_AUTO_LEAVE_BAD", False)
+DISCOVERY_MAX_JOINS_PER_CYCLE: int = _env_int("DISCOVERY_MAX_JOINS_PER_CYCLE", 3)
+DISCOVERY_QUEUE_FILE: Path = STATE_DIR / "discovery_queue.json"
+DISCOVERY_SEEDS_FILE: Path = Path(_env_str("DISCOVERY_SEEDS_FILE", "seeds.yaml"))
+DISCOVERY_TARGET_REGION: str = _env_str("DISCOVERY_TARGET_REGION", "cyprus")
+CYPRUS_IT_CHAT: str = _env_str("CYPRUS_IT_CHAT", "")
+DISCOVERY_SCAN_MESSAGES_LIMIT: int = _env_int("DISCOVERY_SCAN_MESSAGES_LIMIT", 5000)
+
+# --- @kiprinfobot adapter ---
+
+KIPRINFBOT_ENABLED: bool = _env_bool("KIPRINFBOT_ENABLED", True)
+KIPRINFBOT_USERNAME: str = _env_str("KIPRINFBOT_USERNAME", "kiprinfobot")
+KIPRINFBOT_DELAY_SECONDS: float = _env_float("KIPRINFBOT_DELAY_SECONDS", 20.0)
+KIPRINFBOT_REPLY_TIMEOUT_SECONDS: int = _env_int("KIPRINFBOT_REPLY_TIMEOUT_SECONDS", 25)
+KIPRINFBOT_MAX_QUERIES: int = _env_int("KIPRINFBOT_MAX_QUERIES", 6)
+
+# --- Web discovery adapter ---
+
+WEB_DISCOVERY_ENABLED: bool = _env_bool("WEB_DISCOVERY_ENABLED", False)
+WEB_FETCH_DELAY_SECONDS: float = _env_float("WEB_FETCH_DELAY_SECONDS", 5.0)
+WEB_MAX_RESULTS_PER_QUERY: int = _env_int("WEB_MAX_RESULTS_PER_QUERY", 20)
+
+# --- Group quality classifier ---
+
+QUALITY_CACHE_FILE: Path = STATE_DIR / "quality_cache.json"
+QUALITY_SAMPLE_SIZE: int = _env_int("QUALITY_SAMPLE_SIZE", 50)
+QUALITY_LLM_ENABLED: bool = _env_bool("QUALITY_LLM_ENABLED", False)
+QUALITY_LLM_MODEL: str = _env_str("QUALITY_LLM_MODEL", "deepseek-chat")
+
+# --- Query / dossier / export ---
+
+QUERY_MAX_RESULTS: int = _env_int("QUERY_MAX_RESULTS", 50)
+EXPORT_DIR: Path = STATE_DIR / "exports"
+
+# --- Watchlist ---
+
+WATCHLIST_FILE: Path = STATE_DIR / "watchlist.json"
+WATCHLIST_HITS_FILE: Path = STATE_DIR / "watchlist_hits.jsonl"
+
+# --- Control flags (kill switch / remote pause) ---
+
+CONTROL_FLAGS_FILE: Path = STATE_DIR / "control_flags.json"
+CONTROL_FLAG_POLL_SECONDS: int = _env_int("CONTROL_FLAG_POLL_SECONDS", 5)
+
+# --- Message dedup ---
+
+DEDUP_ENABLED: bool = _env_bool("DEDUP_ENABLED", True)
+
 # --- Validation & summary helpers ---
 
 CRITICAL_ENV_KEYS: tuple[str, ...] = (
@@ -287,6 +365,11 @@ def config_summary() -> dict:
         "auth_lockout_seconds": AUTH_LOCKOUT_SECONDS,
         "api_host": API_HOST,
         "api_port": API_PORT,
+        "failover_enabled": FAILOVER_ENABLED,
+        "discovery_enabled": DISCOVERY_ENABLED,
+        "quality_llm_enabled": QUALITY_LLM_ENABLED,
+        "log_level": LOG_LEVEL,
+        "dedup_enabled": DEDUP_ENABLED,
         "admin_secret_set": bool(ADMIN_SECRET),
         "api_token_set": bool(API_TOKEN),
         "telegram_api_id_set": bool(TELEGRAM_API_ID),

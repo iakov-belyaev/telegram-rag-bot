@@ -7,6 +7,12 @@
 # Runtime state (cursors, filter cache, targets)
 state/
 
+# Logs
+logs/
+
+# Local seeds (use seeds.yaml.example as template)
+seeds.yaml
+
 # Telegram Userbot Session Files (CRITICAL: NEVER COMMIT THESE)
 *.session
 *.session-journal
