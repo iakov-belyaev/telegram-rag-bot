@@ -17,7 +17,8 @@ from pyrogram import errors as tg_errors
 
 import config
 import database as db
-from scraper import FloodGate, RateGate, telegram_call
+import metrics
+from scraper import FloodGate, RateGate, iterate_with_flood, telegram_call
 
 
 def log(message: str) -> None:
@@ -29,6 +30,14 @@ def log(message: str) -> None:
 # 1. PURE HELPERS (UNIT-TESTABLE, NO NETWORK)
 # ==========================================
 MENTION_REGEX = re.compile(r"@([A-Za-z0-9_]{4,32})")
+
+
+def _size_key(size: Any) -> int:
+    """Sort key for photo sizes: prefer the smallest file_size (fallback to area)."""
+    file_size = getattr(size, "file_size", None)
+    if file_size:
+        return int(file_size)
+    return int(getattr(size, "width", 0) or 0) * int(getattr(size, "height", 0) or 0)
 
 
 def _parse_dt(value: str) -> Optional[datetime]:
@@ -81,9 +90,14 @@ def compute_common_chats(profile_a: dict, profile_b: dict) -> dict:
 # 2. AGGREGATION FROM INDEXED MESSAGES
 # ==========================================
 async def _scroll_page(offset: Any) -> Any:
-    """Scroll one page of the messages collection (payload only)."""
+    """Scroll one page of the messages collection (payload only).
+
+    Routed through database._qdrant_read for retry/timeout and graceful
+    behavior when the collection does not exist yet.
+    """
     client = db.get_qdrant()
-    return await asyncio.to_thread(
+    return await db._qdrant_read(
+        ([], None),
         client.scroll,
         collection_name=config.MESSAGES_COLLECTION,
         limit=config.PROFILE_SCROLL_PAGE,
@@ -226,13 +240,81 @@ async def aggregate_message_stats(gate: FloodGate) -> dict:
 
 
 # ==========================================
-# 3. PROFILE ENRICHMENT
+# 3. PEER RESOLUTION + PROFILE ENRICHMENT
 # ==========================================
+# Cap the members-scan fallback so resolving one uncached peer never walks a
+# 10k-member chat at ~5 req/s.
+RESOLVE_CONTEXT_SCAN_LIMIT = 1000
+
+
+async def resolve_user(
+    client,
+    gate: FloodGate,
+    user_id: int,
+    context_chat_id: Optional[int] = None,
+) -> Optional[Any]:
+    """Resolve a user id that may not be in the session's peer cache.
+
+    Ladder (never raises):
+      1. client.get_users directly.
+      2. PeerIdInvalid -> scan participants of `context_chat_id` (capped).
+      3. get_chat(user_id) to warm the peer cache, then get_users again.
+      4. Give up: return None and bump the peer_unresolved metric.
+    """
+    try:
+        user = await telegram_call(gate, client.get_users, user_id)
+        if user is not None:
+            metrics.inc("peers_resolved")
+            return user
+    except tg_errors.PeerIdInvalid:
+        pass  # expected for stale ids -- work the ladder
+    except Exception as e:
+        log(f"⚠️ get_users error for {user_id}: {e}")
+
+    if context_chat_id is not None:
+        try:
+            scanned = 0
+            async for member in iterate_with_flood(
+                gate, client.get_chat_members, context_chat_id
+            ):
+                scanned += 1
+                if getattr(getattr(member, "user", None), "id", None) == user_id:
+                    metrics.inc("peers_resolved")
+                    metrics.inc("peers_resolved_via_context")
+                    return member.user
+                if scanned >= RESOLVE_CONTEXT_SCAN_LIMIT:
+                    break
+        except Exception as e:
+            log(f"⚠️ context resolve failed for {user_id} in {context_chat_id}: {e}")
+
+    try:
+        await telegram_call(gate, client.get_chat, user_id)
+        user = await telegram_call(gate, client.get_users, user_id)
+        if user is not None:
+            metrics.inc("peers_resolved")
+            metrics.inc("peers_resolved_via_warmup")
+            return user
+    except Exception as e:
+        log(f"⚠️ warm-cache resolve failed for {user_id}: {e}")
+
+    metrics.inc("peer_unresolved")
+    return None
+
+
 async def enrich_user(
-    client, gate: FloodGate, user_id: int, existing: Optional[dict]
+    client,
+    gate: FloodGate,
+    user_id: int,
+    existing: Optional[dict],
+    context_chat_id: Optional[int] = None,
+    force_refresh: bool = False,
 ) -> dict:
-    """Fetch fresh Telegram user info + profile-photo hash (or reuse fresh cache)."""
-    if existing is not None:
+    """Fetch fresh Telegram user info + profile-photo hash (or reuse fresh cache).
+
+    `force_refresh=True` skips the freshness fast-path (used by `/sweep full`
+    to backfill, e.g., profile photos after a scraper fix).
+    """
+    if existing is not None and not force_refresh:
         updated_at = _parse_dt(existing.get("updated_at", ""))
         if updated_at is not None:
             age = (datetime.now(timezone.utc) - updated_at).total_seconds()
@@ -249,10 +331,9 @@ async def enrich_user(
                     "refreshed": False,
                 }
 
-    try:
-        user = await telegram_call(gate, client.get_users, user_id)
-    except Exception as e:
-        log(f"⚠️ get_users failed for {user_id}: {e}")
+    user = await resolve_user(client, gate, user_id, context_chat_id=context_chat_id)
+    if user is None:
+        log(f"⚠️ unresolvable peer {user_id} — skipping this cycle")
         if existing is not None:
             # Transient network failure: keep cached profile data rather than wiping it.
             return {
@@ -282,31 +363,38 @@ async def enrich_user(
     pfp_hash = ""
     pfp_meta: dict = {}
     try:
-        photos = await telegram_call(gate, client.get_profile_photos, user_id, limit=1)
-        if photos:
-            sizes = list(photos[0])
-            if sizes:
-                chosen = min(
-                    sizes,
-                    key=lambda s: (getattr(s, "file_size", None) or (s.width * s.height)),
-                )
-                blob = await telegram_call(
-                    gate, client.download_media, chosen, in_memory=True
-                )
-                if blob is not None:
-                    raw = blob.getvalue() if hasattr(blob, "getvalue") else bytes(blob)
-                    pfp_hash = hashlib.sha256(raw).hexdigest()[
-                        : config.PFP_HASH_SIZE // 4
-                    ]
-                    pfp_meta = {
-                        "width": getattr(chosen, "width", 0),
-                        "height": getattr(chosen, "height", 0),
-                        "file_size": getattr(chosen, "file_size", 0),
-                    }
+        # Pyrogram >= 2.0 exposes profile photos via the async generator
+        # `get_chat_photos`; `get_profile_photos` does NOT exist (AttributeError).
+        chosen = None
+        async for photo in iterate_with_flood(
+            gate, client.get_chat_photos, user_id, limit=1
+        ):
+            for size in list(getattr(photo, "sizes", None) or []):
+                if chosen is None or _size_key(size) < _size_key(chosen):
+                    chosen = size
+            break
+        if chosen is not None:
+            blob = await telegram_call(
+                gate,
+                client.download_media,
+                getattr(chosen, "file_id", chosen),
+                in_memory=True,
+            )
+            if blob is not None:
+                raw = blob.getvalue() if hasattr(blob, "getvalue") else bytes(blob)
+                pfp_hash = hashlib.sha256(raw).hexdigest()[
+                    : config.PFP_HASH_SIZE // 4
+                ]
+                pfp_meta = {
+                    "width": getattr(chosen, "width", 0),
+                    "height": getattr(chosen, "height", 0),
+                    "file_size": getattr(chosen, "file_size", 0),
+                }
     except Exception as e:
         log(f"⚠️ profile photo fetch failed for {user_id}: {e}")
         pfp_hash = ""
         pfp_meta = {}
+        metrics.inc("profile_photo_failures")
 
     return {
         "bio": bio,
@@ -494,7 +582,9 @@ async def upsert_relations_batch(payloads: list[dict]) -> int:
 # ==========================================
 # 5. FULL SWEEP
 # ==========================================
-async def build_profiles(client, gate: FloodGate, rate: RateGate) -> dict:
+async def build_profiles(
+    client, gate: FloodGate, rate: RateGate, force_refresh: bool = False
+) -> dict:
     """One full profile-building sweep. Returns JSON-safe stats."""
     started = time.time()
     errors = 0
@@ -505,6 +595,7 @@ async def build_profiles(client, gate: FloodGate, rate: RateGate) -> dict:
         stats = await aggregate_message_stats(gate)
     except Exception as e:
         log(f"⚠️ aggregate_message_stats failed: {e}")
+        metrics.inc("profile_sweep_failures")
         return {
             "scanned_points": 0,
             "qualifying_users": 0,
@@ -540,7 +631,19 @@ async def build_profiles(client, gate: FloodGate, rate: RateGate) -> dict:
         try:
             await rate.acquire()
             existing = await db.get_profile(uid)
-            info = await enrich_user(client, gate, uid, existing)
+            context_chat_id = None
+            if u.get("chats"):
+                context_chat_id = max(
+                    u["chats"].items(), key=lambda kv: kv[1].get("count", 0)
+                )[0]
+            info = await enrich_user(
+                client,
+                gate,
+                uid,
+                existing,
+                context_chat_id=context_chat_id,
+                force_refresh=force_refresh,
+            )
 
             common_chat_ids = sorted(u.get("chats", {}).keys())
             common_chat_titles = [
@@ -598,13 +701,17 @@ async def build_profiles(client, gate: FloodGate, rate: RateGate) -> dict:
         errors += 1
         log(f"⚠️ relation assembly/upsert failed: {e}")
 
+    duration = time.time() - started
+    metrics.inc("profile_sweep_runs")
+    metrics.inc("profile_sweep_user_errors", errors)
+    metrics.set_gauge("profile_sweep_last_duration_seconds", duration)
     return {
         "scanned_points": stats.get("scanned_points", 0),
         "qualifying_users": len(qualifying),
         "profiles_upserted": profiles_upserted,
         "relations_upserted": relations_upserted,
         "errors": errors,
-        "duration_seconds": time.time() - started,
+        "duration_seconds": duration,
     }
 
 

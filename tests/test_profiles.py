@@ -103,7 +103,7 @@ async def main():
     async def fake_get_profile(uid):
         return None
 
-    async def fake_enrich(client, gate, uid, existing):
+    async def fake_enrich(client, gate, uid, existing, context_chat_id=None, force_refresh=False):
         return {"bio": f"bio{uid}", "first_name": f"First{uid}", "last_name": "L",
                 "username": "alice_net" if uid == 1 else "bobby_dev", "is_bot": False, "is_premium": False,
                 "pfp_hash": "abcd" * 16, "pfp_meta": {"width": 100, "height": 100},

@@ -20,6 +20,7 @@ from qdrant_client.models import PointStruct
 
 import config
 import database as db
+import metrics
 
 # --- Multi-modal extraction (optional dependencies) ---
 # Availability flags are set at import; warnings are logged lazily on first use.
@@ -69,6 +70,7 @@ class FloodGate:
             delay = min(delay, config.FLOOD_WAIT_MAX_SLEEP_SECONDS)
             self._resume_at = max(self._resume_at, time.time() + delay)
             self._flood_events += 1
+        metrics.inc("flood_wait_events")
 
     async def wait(self) -> None:
         """Block until the gate is clear (loop; safe under contention)."""
@@ -687,6 +689,7 @@ async def index_messages_batch(client, gate: FloodGate, chat, messages: list) ->
         await db.upsert_chat(chat)
         n = await db.upsert_messages(points)
         control.note_indexed(n)
+        metrics.inc("messages_scraped", n)
         return n
     except Exception as e:
         log(f"⚠️ index_messages_batch failed for chat {getattr(chat, 'id', '?')}: {e}")

@@ -12,10 +12,12 @@ import time
 from typing import Awaitable, Callable, Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 
 import config
 import database as db
+import metrics as metrics_lib
 import profiles
 import scraper
 
@@ -91,6 +93,15 @@ def create_app() -> FastAPI:
                 "flood_events_total": flood_events_total,
                 "db": await db.collection_stats(),
             }
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(status_code=500, detail=str(e)[:200])
+
+    @app.get("/prometheus", dependencies=[Depends(_require_token)])
+    async def prometheus() -> PlainTextResponse:
+        try:
+            return PlainTextResponse(metrics_lib.render_prometheus())
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001

@@ -935,11 +935,15 @@ def register_handlers(client: Client, admin_user_id: int) -> None:
             control = scraper.get_control()
             gate = getattr(control, "gate", None) or scraper.FloodGate()
             rate = scraper.RateGate(config.TG_OPS_PER_SECOND, config.TG_OPS_BURST)
+            parts = (message.text or "").split()
+            full = len(parts) > 1 and parts[1].lower() in ("full", "--full")
             _SWEEP_TASK = asyncio.create_task(
-                profiles.build_profiles(client, gate, rate)
+                profiles.build_profiles(client, gate, rate, force_refresh=full)
             )
             _LAST_SWEEP = time.strftime("%Y-%m-%d %H:%M:%S")
-            await message.reply_text("🔄 profile sweep started.")
+            await message.reply_text(
+                "🔄 profile sweep started" + (" (full refresh)" if full else "") + "."
+            )
         except Exception as e:  # noqa: BLE001
             log(f"/sweep failed: {e}")
 
